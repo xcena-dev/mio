@@ -86,6 +86,9 @@ void printUsage(const char *prog_name)
   printf(
       "  --result-dir <path>    Custom result directory (default: auto-create "
       "result/YYYY-MM-DD_HH-MM-SS/)\n");
+  printf(
+      "  --no-progress          Disable live progress bar during measurement "
+      "(reduces measurement noise for sweeps)\n");
   printf("\n");
   printf("Other:\n");
   printf("  --help, -h             Show this help message\n");
@@ -238,6 +241,10 @@ int main(int argc, char *argv[])
     else if (strcmp(argv[i], "--bypass-cache") == 0)
     {
       bypass_cache = true;
+    }
+    else if (strcmp(argv[i], "--no-progress") == 0)
+    {
+      g_progress_enabled = false;
     }
     else if (strcmp(argv[i], "--cpu-affinity") == 0)
     {

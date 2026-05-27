@@ -18,6 +18,12 @@ extern size_t STRIDE_SIZE;  // Default: 64 bytes
 // Global CPU affinity list (empty means no affinity)
 extern std::vector<int> g_cpu_affinity_list;
 
+// When false, ProgressMonitor::wait_until_done returns immediately and no
+// progress lines are printed. Main thread relies on the subsequent join()
+// to block until workers finish, so elapsed_ms isn't padded by polling.
+// Set via --no-progress for sweep runs that want minimum measurement noise.
+extern bool g_progress_enabled;
+
 // Cache flush function
 void flushHostCache(void *hostVirtualPtr, size_t size);
 

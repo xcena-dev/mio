@@ -11,7 +11,12 @@ Usage:
 
 Cache behavior:
   --large-mem (65536 MiB/thread):  Dummy read uses large offset -> cache flush (miss)
-  --small-mem (8192 MiB/thread):   Dummy read uses offset 0     -> cache warmup (hit)
+  --small-mem (4096 MiB/thread):   Dummy read uses offset 0     -> cache warmup (hit)
+
+Repetition:
+  Each (warmup + bench) is one set. NUM_SETS sets are run per mode and the
+  median of the bench Bandwidth values is recorded in the summary along
+  with the raw values for variance inspection.
 
 Full mode:
   seq_read, seq_write,
@@ -25,10 +30,11 @@ Quick mode (4):
 
 import argparse
 import re
+import signal
+import statistics
 import subprocess
 import sys
 import time
-import signal
 from datetime import datetime
 from pathlib import Path
 
@@ -37,41 +43,39 @@ MICROBENCH = REPO_ROOT / "build" / "microbench"
 SUMMARY_DIR = REPO_ROOT / "summary"
 RESULT_DIR = REPO_ROOT / "result"
 
-MEMORY_PER_THREAD = [65536, 8192]
+LARGE_MEM = 65536  # MiB per thread, cache-miss scenario
+SMALL_MEM = 4096   # MiB per thread, cache-hit scenario
+MEMORY_PER_THREAD = [LARGE_MEM, SMALL_MEM]
 
 BLOCK_SIZES = [524288, 1048576, 2097152]
 FLUSH_OFFSET = "0x10000000000"
 
+NUM_SETS = 5  # (warmup + bench) repetitions per mode; summary uses median
 
-def build_sequence(mode_count: int | None) -> list[tuple[str, bool, int | None]]:
-    """Build benchmark sequence with dummy reads interleaved."""
+
+def build_tests(mode_count: int | None) -> list[tuple[str, int | None]]:
+    """Return the list of real (mode, block_size) measurements. No dummies."""
     if mode_count == 4:
-        tests = [
-            ("seq_read", False, None),
-            ("seq_write", False, None),
-            ("random_read", False, 1048576),
-            ("random_write", False, 1048576),
+        return [
+            ("seq_read", None),
+            ("seq_write", None),
+            ("random_read", 1048576),
+            ("random_write", 1048576),
         ]
-    else:
-        tests = [
-            ("seq_read", False, None),
-            ("seq_write", False, None),
-        ]
-        for mode in ("random_read", "zipfian_read"):
-            for bs in BLOCK_SIZES:
-                tests.append((mode, False, bs))
-        tests.append(("random_write", False, 1048576))
-
-    seq: list[tuple[str, bool, int | None]] = []
-    for entry in tests:
-        seq.append(("seq_read", True, None))
-        seq.append(entry)
-    return seq
+    tests: list[tuple[str, int | None]] = [
+        ("seq_read", None),
+        ("seq_write", None),
+    ]
+    for mode in ("random_read", "zipfian_read"):
+        for bs in BLOCK_SIZES:
+            tests.append((mode, bs))
+    tests.append(("random_write", 1048576))
+    return tests
 
 
-def parse_bandwidth(output: str) -> str | None:
-    m = re.search(r"Bandwidth:\s+([\d.]+\s+GB/s)", output)
-    return m.group(1) if m else None
+def parse_bandwidth(output: str) -> float | None:
+    m = re.search(r"Bandwidth:\s+([\d.]+)\s+GB/s", output)
+    return float(m.group(1)) if m else None
 
 
 def command_rt(cmd_list, is_exit=True):
@@ -143,38 +147,11 @@ def run_init(base_result_dir: Path, memory_per_thread: int, mem_args: list[str])
     print("  Init done.\n")
 
 
-def run_bench(
-    mode: str,
-    result_dir: Path,
-    step: int,
-    total: int,
-    is_dummy: bool,
-    block_size: int | None,
-    memory_per_thread: int,
-    cache_hit: bool,
-    mem_args: list[str],
-) -> tuple[bool, str | None]:
-    if is_dummy:
-        label = f"cache_warmup_{step}" if cache_hit else f"cache_flush_{step}"
-    else:
-        label = mode
-    if block_size and not is_dummy:
-        label += f"_bs{block_size}"
-
-    step_dir = result_dir / f"{step:02d}_{label}"
+def run_step(cmd: list[str], label: str, step_dir: Path) -> tuple[bool, float | None]:
+    """Run one microbench invocation. Returns (ok, bandwidth_gbps)."""
     step_dir.mkdir(parents=True, exist_ok=True)
-
-    if is_dummy:
-        offset = "0x0" if cache_hit else FLUSH_OFFSET
-    else:
-        offset = "0x0"
-
-    cmd = build_cmd(mode, memory_per_thread, mem_args, offset, block_size, step_dir)
-
-    tag = ("[WARMUP]" if cache_hit else "[FLUSH]") if is_dummy else "[BENCH]"
-    bs_info = f"  block={block_size}" if block_size and not is_dummy else ""
     print(f"\n{'='*60}")
-    print(f"  Step {step}/{total}  {tag}  {mode}{bs_info}")
+    print(f"  {label}")
     print(f"  Result: {step_dir}")
     print(f"{'='*60}")
 
@@ -185,9 +162,8 @@ def run_bench(
     if ret != 0:
         print(f"  FAILED (exit code {ret}, {elapsed:.1f}s)")
         return False, None
-
     bw = parse_bandwidth(out)
-    print(f"  Done ({elapsed:.1f}s)")
+    print(f"  Done ({elapsed:.1f}s)" + (f"  BW={bw:.2f} GB/s" if bw is not None else ""))
     return True, bw
 
 
@@ -206,9 +182,9 @@ def parse_args():
 
     size_group = parser.add_mutually_exclusive_group()
     size_group.add_argument("--small-mem", action="store_true",
-                            help="128 GiB total (8192 MiB/thread x 16 threads) — cache hit scenario")
+                            help=f"{SMALL_MEM} MiB/thread x 16 threads — cache hit scenario")
     size_group.add_argument("--large-mem", action="store_true",
-                            help="1 TiB total (65536 MiB/thread x 16 threads) — cache miss scenario")
+                            help=f"{LARGE_MEM} MiB/thread x 16 threads — cache miss scenario")
 
     parser.add_argument("--no-init", action="store_true",
                         help="Skip initial seq_write (memory already initialized)")
@@ -224,21 +200,23 @@ def main():
 
     args = parse_args()
 
-    # Build memory binding arguments for microbench
     if args.devdax:
         mem_args = ["--devdax", args.devdax]
     else:
         mem_args = ["--membind", str(args.membind)]
 
     if args.small_mem:
-        memory_sizes = [8192]
+        memory_sizes = [SMALL_MEM]
     elif args.large_mem:
-        memory_sizes = [65536]
+        memory_sizes = [LARGE_MEM]
     else:
         memory_sizes = MEMORY_PER_THREAD
 
-    sequence = build_sequence(args.mode_count)
-    total = len(sequence)
+    tests = build_tests(args.mode_count)
+    total_modes = len(tests)
+
+    # Aggregated medians for the final stdout summary
+    results: dict[int, list[tuple[str, int | None, float]]] = {}
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     base_result_dir = RESULT_DIR / timestamp
@@ -249,12 +227,12 @@ def main():
 
     preset = f"quick ({args.mode_count})" if args.mode_count else "full"
     mem_target = f"devdax={args.devdax}" if args.devdax else f"membind={args.membind}"
-    print(f"Memory Benchmark Automation  [{preset}]")
+    print(f"Memory Benchmark Automation  [{preset}]  sets={NUM_SETS} (median)")
     print(f"Memory target: {mem_target}")
     print(f"Base results directory: {base_result_dir}")
     print(f"Summary file: {summary_file}")
     print(f"Memory per thread sizes: {memory_sizes}")
-    print(f"Steps per memory size: {total}")
+    print(f"Modes per memory size: {total_modes}  (x{NUM_SETS} sets each)")
 
     with open(summary_file, "w") as f:
         f.write(f"Memory Benchmark Summary  ({timestamp})  [{preset}]\n")
@@ -271,24 +249,62 @@ def main():
         print(f"{'#'*60}")
 
         result_dir = base_result_dir / f"mem_{mem_size}"
-        cache_hit = mem_size == 8192
+        cache_hit = mem_size == SMALL_MEM
+        dummy_tag = "warmup" if cache_hit else "flush"
+        dummy_offset = "0x0" if cache_hit else FLUSH_OFFSET
+        results[mem_size] = []
 
-        for i, (mode, is_dummy, block_size) in enumerate(sequence, start=1):
-            ok, bw = run_bench(
-                mode, result_dir, i, total, is_dummy, block_size, mem_size, cache_hit,
-                mem_args,
-            )
-            if not ok:
-                print(f"\nStep {i} ({mode}) failed. Aborting.")
-                sys.exit(1)
+        for mode_idx, (mode, block_size) in enumerate(tests, start=1):
+            mode_label = mode + (f"_bs{block_size}" if block_size else "")
+            mode_dir = result_dir / f"{mode_idx:02d}_{mode_label}"
 
-            if not is_dummy and bw:
+            print(f"\n{'#'*60}")
+            print(f"  Mode {mode_idx}/{total_modes}: {mode_label}  ({NUM_SETS} sets)")
+            print(f"{'#'*60}")
+
+            bws: list[float] = []
+            for set_idx in range(1, NUM_SETS + 1):
+                # warmup (cache_hit) or flush (cache_miss) dummy
+                dummy_dir = mode_dir / f"set{set_idx}_{dummy_tag}"
+                dummy_cmd = build_cmd("seq_read", mem_size, mem_args,
+                                      dummy_offset, None, dummy_dir)
+                ok, _ = run_step(
+                    dummy_cmd,
+                    f"[{dummy_tag.upper()}] mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{NUM_SETS}",
+                    dummy_dir,
+                )
+                if not ok:
+                    print(f"\n{mode_label} set{set_idx} {dummy_tag} failed. Aborting.")
+                    sys.exit(1)
+
+                # bench
+                bench_dir = mode_dir / f"set{set_idx}_bench"
+                bench_cmd = build_cmd(mode, mem_size, mem_args,
+                                      "0x0", block_size, bench_dir)
+                ok, bw = run_step(
+                    bench_cmd,
+                    f"[BENCH]  mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{NUM_SETS}",
+                    bench_dir,
+                )
+                if not ok:
+                    print(f"\n{mode_label} set{set_idx} bench failed. Aborting.")
+                    sys.exit(1)
+                if bw is not None:
+                    bws.append(bw)
+
+            if bws:
+                med = statistics.median(bws)
                 bs_str = f"{block_size} B" if block_size else "-"
-                line = f"{mem_size:>12} {mode:<20} {bs_str:>12} {bw:>15}"
-                print(f"  >> {line}")
+                bw_str = f"{med:.2f} GB/s"
+                line = f"{mem_size:>12} {mode:<20} {bs_str:>12} {bw_str:>15}"
+                raw_str = "[" + ", ".join(f"{x:.2f}" for x in bws) + "]"
+                print(f"\n  >> MEDIAN  {line}  raw={raw_str}")
                 with open(summary_file, "a") as f:
                     f.write(line + "\n")
                     f.flush()
+                results[mem_size].append((mode, block_size, med))
+            else:
+                print(f"  WARNING: no bandwidth parsed for {mode_label}")
 
         with open(summary_file, "a") as f:
             f.write(f"{'-'*70}\n")
@@ -300,6 +316,24 @@ def main():
     print(f"  All steps completed successfully!")
     print(f"  Results: {base_result_dir}")
     print(f"  Summary: {summary_file}")
+    print(f"{'='*60}")
+
+    # Final aggregated summary on stdout (median per mode, grouped by mem size)
+    print(f"\n{'='*60}")
+    print(f"  Final Summary")
+    print(f"{'='*60}")
+    for mem_size in memory_sizes:
+        if mem_size == SMALL_MEM:
+            header = "[Small size]"
+        elif mem_size == LARGE_MEM:
+            header = "[Large size]"
+        else:
+            header = f"[mem {mem_size}]"
+        print(f"\n{header}")
+        for mode, block_size, med in results.get(mem_size, []):
+            bs_str = f"{block_size} B" if block_size else "-"
+            bw_str = f"{med:.2f} GB/s"
+            print(f"  {mode:<20} {bs_str:>12} {bw_str:>15}")
     print(f"{'='*60}")
 
 

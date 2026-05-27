@@ -40,50 +40,60 @@ static inline uint64_t rdtscp()
 size_t BLOCK_SIZE = 64;  // Default: 64 bytes
 size_t STRIDE_SIZE = 64; // Default: 64 bytes
 
-// Progress update interval (number of blocks between updates)
-#define UPDATE_INTERVAL 1000
+// Progress update threshold (bytes accumulated per worker before publishing
+// to the shared atomic). Byte-based instead of block-count based so the
+// progress bar updates smoothly regardless of BLOCK_SIZE — with large
+// BLOCK_SIZE (e.g. 32 MiB) a count-based threshold could exceed the total
+// blocks per thread and leave the bar stuck at 0% until threads finish.
+#define PROGRESS_UPDATE_BYTES (256ULL * 1024 * 1024)
 
 // Global CPU affinity list
 std::vector<int> g_cpu_affinity_list;
 
-// Progress monitoring class for benchmarks
+// Live progress reporting toggle (see benchmark.h for rationale).
+bool g_progress_enabled = true;
+
+// Progress monitor: main thread polls the shared counter on a fixed sleep
+// cadence (api_test pattern). poll_ms bounds the worst-case padding between
+// actual worker completion and the polling exit (≤ poll_ms). print cadence
+// is throttled separately so screen output isn't too noisy when poll_ms is
+// short. When g_progress_enabled is false, wait_until_done is a no-op and
+// the caller's subsequent join() bounds elapsed_ms within join overhead.
 class ProgressMonitor
 {
 public:
   ProgressMonitor(size_t total_bytes, const char *operation_name)
       : total_bytes_(total_bytes),
         bytes_processed_(0),
-        stop_flag_(false),
-        started_(false),
         name_(operation_name) {}
 
-  ~ProgressMonitor() { stop(); }
-
-  void start()
+  // Block on the main thread until workers report >= total_bytes via
+  // add_bytes(). Polls every poll_ms (≤ poll_ms padding on completion);
+  // prints at most every print_ms.
+  void wait_until_done(int print_ms = 1000, int poll_ms = 100)
   {
-    started_ = true;
-    printf("\n");
-    monitor_thread_ = thread([this]()
-                             {
-      while (!stop_flag_.load()) {
-        print_progress();
-        this_thread::sleep_for(chrono::milliseconds(1000));
-      }
-      print_progress(); });
-  }
-
-  void stop()
-  {
-    if (started_ && monitor_thread_.joinable())
+    if (!g_progress_enabled)
     {
-      stop_flag_.store(true);
-      monitor_thread_.join();
-      started_ = false;
+      return;
     }
+    printf("\n");
+    auto last_print = steady_clock::now() - chrono::milliseconds(print_ms);
+    while (bytes_processed_.load(memory_order_relaxed) < total_bytes_)
+    {
+      auto now = steady_clock::now();
+      if (now - last_print >= chrono::milliseconds(print_ms))
+      {
+        print_progress();
+        last_print = now;
+      }
+      this_thread::sleep_for(chrono::milliseconds(poll_ms));
+    }
+    print_progress();
   }
 
   void add_bytes(size_t bytes)
   {
+    if (!g_progress_enabled) return;
     bytes_processed_.fetch_add(bytes, memory_order_relaxed);
   }
 
@@ -112,9 +122,6 @@ private:
 
   size_t total_bytes_;
   atomic<size_t> bytes_processed_;
-  atomic<bool> stop_flag_;
-  thread monitor_thread_;
-  bool started_;
   const char *name_;
 };
 
@@ -176,6 +183,7 @@ BandwidthResult measureSequentialRead(void *data, size_t size,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Signal that this thread is ready
@@ -189,75 +197,86 @@ BandwidthResult measureSequentialRead(void *data, size_t size,
 
                            auto thread_start = steady_clock::now();
 
-                           // Sequential read using AVX2 (8 int32_t at a time)
+                           // Sequential read with BLOCK_SIZE outer loop + 32B AVX2 inner loop.
+                           // Progress hook lives on the outer loop so atomic update runs once per
+                           // block (avoids cache-line ping-pong on `progress.add_bytes()` atomic).
                            __m256i acc = _mm256_setzero_si256();
-                           size_t i = 0;
                            size_t local_bytes = 0;
+                           const size_t block_ints = BLOCK_SIZE / sizeof(int32_t);
+                           const size_t num_full_blocks = per_thread_ints / block_ints;
 #ifdef ENABLE_LATENCY_MEASURE
                            // For sequential, measure every LATENCY_SAMPLE_INTERVAL cache lines (64
                            // bytes = 2 AVX loads) This ensures we measure cold cache line access
                            size_t cache_line_count = 0;
                            const size_t AVX_LOADS_PER_CACHELINE = 2; // 64B cache line / 32B AVX = 2
 #endif
-                           for (; i + 8 <= per_thread_ints; i += 8)
+
+                           for (size_t blk = 0; blk < num_full_blocks; blk++)
                            {
+                             const size_t base_ints = blk * block_ints;
+                             for (size_t j = 0; j + 8 <= block_ints; j += 8)
+                             {
+                               size_t i = base_ints + j;
 #ifdef ENABLE_TRACING
-                             uint64_t ts = rdtsc();
+                               uint64_t ts = rdtsc();
 #endif
 #ifdef ENABLE_LATENCY_MEASURE
-                             // Measure at the start of each sampled cache line
-                             if (cache_line_count % LATENCY_SAMPLE_INTERVAL == 0 &&
-                                 (i / 8) % AVX_LOADS_PER_CACHELINE == 0)
-                             {
-                               uint64_t start = rdtscp();
-                               __m256i data_vec = bypass_cache
-                                                      ? _mm256_stream_load_si256(
-                                                            reinterpret_cast<__m256i *>(&thread_data[i]))
-                                                      : _mm256_loadu_si256(
-                                                            reinterpret_cast<const __m256i *>(&thread_data[i]));
-                               uint64_t end = rdtscp();
-                               latency_buffer.push_back(end - start);
-                               acc = _mm256_add_epi32(acc, data_vec);
-                             }
-                             else
-                             {
-                               __m256i data_vec = bypass_cache
-                                                      ? _mm256_stream_load_si256(
-                                                            reinterpret_cast<__m256i *>(&thread_data[i]))
-                                                      : _mm256_loadu_si256(
-                                                            reinterpret_cast<const __m256i *>(&thread_data[i]));
-                               acc = _mm256_add_epi32(acc, data_vec);
-                             }
-                             // Increment cache line counter every 2 AVX loads
-                             if ((i / 8) % AVX_LOADS_PER_CACHELINE == 1)
-                             {
-                               cache_line_count++;
-                             }
+                               if (cache_line_count % LATENCY_SAMPLE_INTERVAL == 0 &&
+                                   (j / 8) % AVX_LOADS_PER_CACHELINE == 0)
+                               {
+                                 uint64_t start = rdtscp();
+                                 __m256i data_vec = bypass_cache
+                                                        ? _mm256_stream_load_si256(
+                                                              reinterpret_cast<__m256i *>(&thread_data[i]))
+                                                        : _mm256_loadu_si256(
+                                                              reinterpret_cast<const __m256i *>(&thread_data[i]));
+                                 uint64_t end = rdtscp();
+                                 latency_buffer.push_back(end - start);
+                                 acc = _mm256_add_epi32(acc, data_vec);
+                               }
+                               else
+                               {
+                                 __m256i data_vec = bypass_cache
+                                                        ? _mm256_stream_load_si256(
+                                                              reinterpret_cast<__m256i *>(&thread_data[i]))
+                                                        : _mm256_loadu_si256(
+                                                              reinterpret_cast<const __m256i *>(&thread_data[i]));
+                                 acc = _mm256_add_epi32(acc, data_vec);
+                               }
+                               if ((j / 8) % AVX_LOADS_PER_CACHELINE == 1)
+                               {
+                                 cache_line_count++;
+                               }
 #else
-                             __m256i data_vec = bypass_cache
-                                                    ? _mm256_stream_load_si256(
-                                                          reinterpret_cast<__m256i *>(&thread_data[i]))
-                                                    : _mm256_loadu_si256(
-                                                          reinterpret_cast<const __m256i *>(&thread_data[i]));
-                             acc = _mm256_add_epi32(acc, data_vec);
+                               __m256i data_vec = bypass_cache
+                                                      ? _mm256_stream_load_si256(
+                                                            reinterpret_cast<__m256i *>(&thread_data[i]))
+                                                      : _mm256_loadu_si256(
+                                                            reinterpret_cast<const __m256i *>(&thread_data[i]));
+                               acc = _mm256_add_epi32(acc, data_vec);
 #endif
 #ifdef ENABLE_TRACING
-                             trace_buffer.push_back({ts, (uintptr_t)&thread_data[i], 32, 0});
+                               trace_buffer.push_back({ts, (uintptr_t)&thread_data[i], 32, 0});
 #endif
-                             local_bytes += 32;
-                             if ((i / 8 + 1) % UPDATE_INTERVAL == 0)
+                             }
+
+                             local_bytes += BLOCK_SIZE;
+                             if (local_bytes >= PROGRESS_UPDATE_BYTES)
                              {
                                progress.add_bytes(local_bytes);
                                local_bytes = 0;
                              }
                            }
 
-                           // Handle remaining elements
+                           // Drain accumulator
                            volatile long long sum = 0;
                            int32_t temp[8];
                            _mm256_storeu_si256(reinterpret_cast<__m256i *>(temp), acc);
                            for (int j = 0; j < 8; j++)
                              sum += temp[j];
+
+                           // Leftover (last partial block: scalar fallback)
+                           size_t i = num_full_blocks * block_ints;
                            for (; i < per_thread_ints; i++)
                            {
 #ifdef ENABLE_TRACING
@@ -293,15 +312,18 @@ BandwidthResult measureSequentialRead(void *data, size_t size,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
@@ -355,6 +377,7 @@ BandwidthResult measureSequentialWrite(void *data, size_t size, int num_threads,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Signal that this thread is ready
@@ -368,31 +391,41 @@ BandwidthResult measureSequentialWrite(void *data, size_t size, int num_threads,
 
                            auto thread_start = steady_clock::now();
 
-                           // Sequential write using AVX2 (8 int32_t at a time)
-                           size_t i = 0;
+                           // Sequential write with BLOCK_SIZE outer loop + 32B AVX2 inner loop.
+                           // Progress hook lives on the outer loop so atomic update runs once per
+                           // block (avoids cache-line ping-pong on `bytes_processed_`).
                            size_t local_bytes = 0;
-                           for (; i + 8 <= per_thread_ints; i += 8)
+                           const size_t block_ints = BLOCK_SIZE / sizeof(int32_t);
+                           const size_t num_full_blocks = per_thread_ints / block_ints;
+
+                           for (size_t blk = 0; blk < num_full_blocks; blk++)
                            {
-#ifdef ENABLE_TRACING
-                             uint64_t ts = rdtsc();
-#endif
-                             __m256i data_vec = _mm256_set_epi32(i + 7, i + 6, i + 5, i + 4, i + 3,
-                                                                 i + 2, i + 1, i);
-                             if (bypass_cache)
+                             const size_t base_ints = blk * block_ints;
+                             for (size_t j = 0; j + 8 <= block_ints; j += 8)
                              {
-                               _mm256_stream_si256(reinterpret_cast<__m256i *>(&thread_data[i]),
-                                                   data_vec);
-                             }
-                             else
-                             {
-                               _mm256_storeu_si256(reinterpret_cast<__m256i *>(&thread_data[i]),
-                                                   data_vec);
-                             }
+                               size_t i = base_ints + j;
 #ifdef ENABLE_TRACING
-                             trace_buffer.push_back({ts, (uintptr_t)&thread_data[i], 32, 1});
+                               uint64_t ts = rdtsc();
 #endif
-                             local_bytes += 32;
-                             if ((i / 8 + 1) % UPDATE_INTERVAL == 0)
+                               __m256i data_vec = _mm256_set_epi32(i + 7, i + 6, i + 5, i + 4,
+                                                                   i + 3, i + 2, i + 1, i);
+                               if (bypass_cache)
+                               {
+                                 _mm256_stream_si256(reinterpret_cast<__m256i *>(&thread_data[i]),
+                                                     data_vec);
+                               }
+                               else
+                               {
+                                 _mm256_storeu_si256(reinterpret_cast<__m256i *>(&thread_data[i]),
+                                                     data_vec);
+                               }
+#ifdef ENABLE_TRACING
+                               trace_buffer.push_back({ts, (uintptr_t)&thread_data[i], 32, 1});
+#endif
+                             }
+
+                             local_bytes += BLOCK_SIZE;
+                             if (local_bytes >= PROGRESS_UPDATE_BYTES)
                              {
                                progress.add_bytes(local_bytes);
                                local_bytes = 0;
@@ -405,7 +438,8 @@ BandwidthResult measureSequentialWrite(void *data, size_t size, int num_threads,
                              _mm_sfence();
                            }
 
-                           // Handle remaining elements
+                           // Leftover (last partial block: scalar fallback)
+                           size_t i = num_full_blocks * block_ints;
                            for (; i < per_thread_ints; i++)
                            {
 #ifdef ENABLE_TRACING
@@ -423,6 +457,7 @@ BandwidthResult measureSequentialWrite(void *data, size_t size, int num_threads,
                            thread_times[t] =
                                duration_cast<microseconds>(thread_end - thread_start).count() /
                                1000.0;
+                           flushHostCache(thread_data, per_thread_size);
 #ifdef ENABLE_TRACING
                            collectTraceBuffer();
 #endif
@@ -438,15 +473,18 @@ BandwidthResult measureSequentialWrite(void *data, size_t size, int num_threads,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
@@ -520,6 +558,7 @@ BandwidthResult measureRandomRead(void *data, size_t size, int num_threads,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Generate random indices
@@ -545,19 +584,18 @@ BandwidthResult measureRandomRead(void *data, size_t size, int num_threads,
 
                            auto thread_start = steady_clock::now();
 
-                           // Random read using AVX2
+                           // Random read with per-block outer loop + 32B AVX2 inner loop.
+                           // Per-block progress hook avoids cache-line ping-pong on the atomic.
                            __m256i acc = _mm256_setzero_si256();
                            size_t local_bytes = 0;
+                           const size_t block_ints = BLOCK_SIZE / sizeof(int32_t);
 #ifdef ENABLE_LATENCY_MEASURE
                            size_t block_count = 0;
 #endif
+
                            for (size_t i = 0; i < num_blocks; i++)
                            {
-                             size_t offset_ints = (indices[i] * BLOCK_SIZE) / sizeof(int32_t);
-                             size_t block_ints =
-                                 BLOCK_SIZE / sizeof(int32_t); // Number of ints per block
-
-                             // Read entire block using AVX2
+                             const size_t offset_ints = (indices[i] * BLOCK_SIZE) / sizeof(int32_t);
                              size_t j = 0;
 #ifdef ENABLE_LATENCY_MEASURE
                              // Measure latency only on first access of each sampled block (cold
@@ -594,7 +632,7 @@ BandwidthResult measureRandomRead(void *data, size_t size, int num_threads,
 #endif
                              }
                              local_bytes += BLOCK_SIZE;
-                             if ((i + 1) % UPDATE_INTERVAL == 0)
+                             if (local_bytes >= PROGRESS_UPDATE_BYTES)
                              {
                                progress.add_bytes(local_bytes);
                                local_bytes = 0;
@@ -631,15 +669,18 @@ BandwidthResult measureRandomRead(void *data, size_t size, int num_threads,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
@@ -685,6 +726,7 @@ BandwidthResult measureRandomWrite(void *data, size_t size, int num_threads,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Generate random indices
@@ -710,18 +752,19 @@ BandwidthResult measureRandomWrite(void *data, size_t size, int num_threads,
 
                            auto thread_start = steady_clock::now();
 
-                           // Random write using AVX2
+                           // Random write with per-block outer loop + 32B AVX2 inner loop.
+                           // Same structure as the read counterpart; progress hook fires once
+                           // per block to avoid cache-line ping-pong on the atomic counter.
                            size_t local_bytes = 0;
+                           const size_t block_ints = BLOCK_SIZE / sizeof(int32_t);
+
                            for (size_t i = 0; i < num_blocks; i++)
                            {
-                             size_t offset_ints = (indices[i] * BLOCK_SIZE) / sizeof(int32_t);
-                             size_t block_ints =
-                                 BLOCK_SIZE / sizeof(int32_t); // Number of ints per block
+                             const size_t offset_ints = (indices[i] * BLOCK_SIZE) / sizeof(int32_t);
 
                              // Write entire block using AVX2
                              __m256i value = _mm256_set1_epi32(static_cast<int32_t>(i));
-                             size_t j = 0;
-                             for (; j + 8 <= block_ints; j += 8)
+                             for (size_t j = 0; j + 8 <= block_ints; j += 8)
                              {
 #ifdef ENABLE_TRACING
                                uint64_t ts = rdtsc();
@@ -744,7 +787,7 @@ BandwidthResult measureRandomWrite(void *data, size_t size, int num_threads,
 #endif
                              }
                              local_bytes += BLOCK_SIZE;
-                             if ((i + 1) % UPDATE_INTERVAL == 0)
+                             if (local_bytes >= PROGRESS_UPDATE_BYTES)
                              {
                                progress.add_bytes(local_bytes);
                                local_bytes = 0;
@@ -762,6 +805,8 @@ BandwidthResult measureRandomWrite(void *data, size_t size, int num_threads,
                            thread_times[t] =
                                duration_cast<microseconds>(thread_end - thread_start).count() /
                                1000.0;
+                           flushHostCache(thread_data, per_thread_size);
+
 #ifdef ENABLE_TRACING
                            collectTraceBuffer();
 #endif
@@ -777,15 +822,18 @@ BandwidthResult measureRandomWrite(void *data, size_t size, int num_threads,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
@@ -838,6 +886,7 @@ BandwidthResult measureZipfianRead(void *data, size_t size, int num_threads,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Generate and shuffle block indices (same as random read)
@@ -857,31 +906,11 @@ BandwidthResult measureZipfianRead(void *data, size_t size, int num_threads,
                            buildZipfianCDF(cdf, num_blocks, zipfian_alpha);
 
                            vector<size_t> access_sequence(num_blocks);
-                           // rank_count[r] = how many times rank r was sampled
-                           vector<size_t> rank_count(num_blocks, 0);
                            uniform_real_distribution<double> udist(0.0, 1.0);
                            for (size_t i = 0; i < num_blocks; i++)
                            {
                              size_t rank = sampleZipfian(cdf, udist(gen));
                              access_sequence[i] = indices[rank];
-                             rank_count[rank]++;
-                           }
-
-                           // Debug: print top 3 hottest blocks for this thread
-                           {
-                             size_t top_n = 3;
-                             if (top_n > num_blocks) top_n = num_blocks;
-                             printf("  [Thread %d] Zipfian access_sequence stats (num_blocks=%zu, alpha=%.2f):\n",
-                                    t, num_blocks, zipfian_alpha);
-                             for (size_t r = 0; r < top_n; r++)
-                             {
-                               double read_bytes = (double)rank_count[r] * BLOCK_SIZE;
-                               double read_mib = read_bytes / (1024.0 * 1024.0);
-                               printf("    rank %zu (block %zu): %zu accesses (%.2f MiB)\n",
-                                      r, indices[r], rank_count[r], read_mib);
-                             }
-                             double total_read_mib = (double)num_blocks * BLOCK_SIZE / (1024.0 * 1024.0);
-                             printf("    total: %zu accesses (%.2f MiB)\n", num_blocks, total_read_mib);
                            }
 
                            // Signal that this thread is ready
@@ -905,6 +934,7 @@ BandwidthResult measureZipfianRead(void *data, size_t size, int num_threads,
                            {
                              size_t offset_ints = (access_sequence[i] * BLOCK_SIZE) / sizeof(int32_t);
                              size_t block_ints = BLOCK_SIZE / sizeof(int32_t);
+                             int32_t *block_ptr = &thread_data[offset_ints];
 
                              // Read entire block using AVX2
                              size_t j = 0;
@@ -940,8 +970,12 @@ BandwidthResult measureZipfianRead(void *data, size_t size, int num_threads,
                                    {ts, (uintptr_t)&thread_data[offset_ints + j], 32, 0});
 #endif
                              }
+                             if (!bypass_cache)
+                             {
+                               flushHostCache(block_ptr, BLOCK_SIZE);
+                             }
                              local_bytes += BLOCK_SIZE;
-                             if ((i + 1) % UPDATE_INTERVAL == 0)
+                             if (local_bytes >= PROGRESS_UPDATE_BYTES)
                              {
                                progress.add_bytes(local_bytes);
                                local_bytes = 0;
@@ -978,15 +1012,18 @@ BandwidthResult measureZipfianRead(void *data, size_t size, int num_threads,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
@@ -1035,6 +1072,7 @@ BandwidthResult measureStrideRead(void *data, size_t size, int num_threads,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Signal that this thread is ready
@@ -1083,7 +1121,7 @@ BandwidthResult measureStrideRead(void *data, size_t size, int num_threads,
 #endif
                                    local_bytes += 32;
                                    access_count++;
-                                   if (access_count % UPDATE_INTERVAL == 0)
+                                   if (local_bytes >= PROGRESS_UPDATE_BYTES)
                                    {
                                      progress.add_bytes(local_bytes);
                                      local_bytes = 0;
@@ -1120,15 +1158,18 @@ BandwidthResult measureStrideRead(void *data, size_t size, int num_threads,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
@@ -1179,6 +1220,7 @@ BandwidthResult measureStrideWrite(void *data, size_t size, int num_threads,
                            if (!bypass_cache)
                            {
                              flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
                            }
 
                            // Signal that this thread is ready
@@ -1233,7 +1275,7 @@ BandwidthResult measureStrideWrite(void *data, size_t size, int num_threads,
 #endif
                                    local_bytes += 32;
                                    access_count++;
-                                   if (access_count % UPDATE_INTERVAL == 0)
+                                   if (local_bytes >= PROGRESS_UPDATE_BYTES)
                                    {
                                      progress.add_bytes(local_bytes);
                                      local_bytes = 0;
@@ -1269,15 +1311,18 @@ BandwidthResult measureStrideWrite(void *data, size_t size, int num_threads,
   auto start_time = steady_clock::now();
 
   // Start all threads simultaneously
-  progress.start();
   start_flag.store(true);
 
-  // Wait for all threads to complete
+  // Drive the progress monitor on this (main) thread — no separate monitor
+  // thread is spawned, so worker count == active thread count and there is
+  // no CPU-share bias affecting low-thread-count measurements.
+  progress.wait_until_done();
+
+  // Workers are essentially done by the time wait_until_done() returns.
   for (auto &th : threads)
   {
     th.join();
   }
-  progress.stop();
 
   auto end_time = steady_clock::now();
   double elapsed_ms =
