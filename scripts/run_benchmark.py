@@ -14,9 +14,10 @@ Cache behavior:
   --small-mem (4096 MiB/thread):   Dummy read uses offset 0     -> cache warmup (hit)
 
 Repetition:
-  Each (warmup + bench) is one set. NUM_SETS sets are run per mode and the
-  median of the bench Bandwidth values is recorded in the summary along
-  with the raw values for variance inspection.
+  Only the small (cache-hit) region is jittery, so it runs NUM_SETS
+  (warmup + bench) sets per mode and records the median bandwidth (raw
+  values printed for variance inspection). The large region is stable and
+  runs a single (flush + bench) set.
 
 Full mode:
   seq_read, seq_write,
@@ -50,7 +51,7 @@ MEMORY_PER_THREAD = [LARGE_MEM, SMALL_MEM]
 BLOCK_SIZES = [524288, 1048576, 2097152]
 FLUSH_OFFSET = "0x10000000000"
 
-NUM_SETS = 5  # (warmup + bench) repetitions per mode; summary uses median
+NUM_SETS = 5  # small-mem repetitions; median is taken there. large-mem always runs once.
 
 
 def build_tests(mode_count: int | None) -> list[tuple[str, int | None]]:
@@ -227,12 +228,13 @@ def main():
 
     preset = f"quick ({args.mode_count})" if args.mode_count else "full"
     mem_target = f"devdax={args.devdax}" if args.devdax else f"membind={args.membind}"
-    print(f"Memory Benchmark Automation  [{preset}]  sets={NUM_SETS} (median)")
+    print(f"Memory Benchmark Automation  [{preset}]")
     print(f"Memory target: {mem_target}")
     print(f"Base results directory: {base_result_dir}")
     print(f"Summary file: {summary_file}")
     print(f"Memory per thread sizes: {memory_sizes}")
-    print(f"Modes per memory size: {total_modes}  (x{NUM_SETS} sets each)")
+    print(f"Modes per memory size: {total_modes}  "
+          f"(small={NUM_SETS} sets/median, large=1 set)")
 
     with open(summary_file, "w") as f:
         f.write(f"Memory Benchmark Summary  ({timestamp})  [{preset}]\n")
@@ -250,6 +252,9 @@ def main():
 
         result_dir = base_result_dir / f"mem_{mem_size}"
         cache_hit = mem_size == SMALL_MEM
+        # Only the small (cache-hit) region is jittery, so repeat + median there.
+        # Large region is stable, so a single set is enough.
+        num_sets = NUM_SETS if cache_hit else 1
         dummy_tag = "warmup" if cache_hit else "flush"
         dummy_offset = "0x0" if cache_hit else FLUSH_OFFSET
         results[mem_size] = []
@@ -259,18 +264,18 @@ def main():
             mode_dir = result_dir / f"{mode_idx:02d}_{mode_label}"
 
             print(f"\n{'#'*60}")
-            print(f"  Mode {mode_idx}/{total_modes}: {mode_label}  ({NUM_SETS} sets)")
+            print(f"  Mode {mode_idx}/{total_modes}: {mode_label}  ({num_sets} sets)")
             print(f"{'#'*60}")
 
             bws: list[float] = []
-            for set_idx in range(1, NUM_SETS + 1):
+            for set_idx in range(1, num_sets + 1):
                 # warmup (cache_hit) or flush (cache_miss) dummy
                 dummy_dir = mode_dir / f"set{set_idx}_{dummy_tag}"
                 dummy_cmd = build_cmd("seq_read", mem_size, mem_args,
                                       dummy_offset, None, dummy_dir)
                 ok, _ = run_step(
                     dummy_cmd,
-                    f"[{dummy_tag.upper()}] mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{NUM_SETS}",
+                    f"[{dummy_tag.upper()}] mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{num_sets}",
                     dummy_dir,
                 )
                 if not ok:
@@ -283,7 +288,7 @@ def main():
                                       "0x0", block_size, bench_dir)
                 ok, bw = run_step(
                     bench_cmd,
-                    f"[BENCH]  mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{NUM_SETS}",
+                    f"[BENCH]  mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{num_sets}",
                     bench_dir,
                 )
                 if not ok:
@@ -297,8 +302,11 @@ def main():
                 bs_str = f"{block_size} B" if block_size else "-"
                 bw_str = f"{med:.2f} GB/s"
                 line = f"{mem_size:>12} {mode:<20} {bs_str:>12} {bw_str:>15}"
-                raw_str = "[" + ", ".join(f"{x:.2f}" for x in bws) + "]"
-                print(f"\n  >> MEDIAN  {line}  raw={raw_str}")
+                if cache_hit:
+                    raw_str = "[" + ", ".join(f"{x:.2f}" for x in bws) + "]"
+                    print(f"\n  >> MEDIAN  {line}  raw={raw_str}")
+                else:
+                    print(f"\n  >> RESULT  {line}")
                 with open(summary_file, "a") as f:
                     f.write(line + "\n")
                     f.flush()
