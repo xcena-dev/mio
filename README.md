@@ -115,6 +115,10 @@ Memory size presets (with 16 threads):
 
 Supported modes: `seq_read`, `seq_write`, `random_read`, `random_write`, `stride_read`, `stride_write`, `zipfian_read`
 
+### PXL explicit prefetch test
+
+`prefetch_test` mode measures the effect of explicit PXL device prefetch on cold reads. See [docs/prefetch_test.md](docs/prefetch_test.md).
+
 ### Units
 
 | Parameter | Unit | Example |

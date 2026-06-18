@@ -14,6 +14,8 @@
 
 #include "numa_affinity.h"
 
+#include <pxl/memory.hpp>
+
 #ifdef ENABLE_TRACING
 #include "tracing.h"
 #endif
@@ -24,6 +26,12 @@
 
 using namespace std;
 using namespace chrono;
+
+// Issue an explicit PXL device prefetch for [addr, addr+size).
+static inline void devicePrefetch(void *addr, size_t size)
+{
+  pxl::prefetchMemory(addr, size);
+}
 
 // rdtscp inline function for delay injection (always available)
 #ifndef ENABLE_LATENCY_MEASURE
@@ -1635,4 +1643,171 @@ BandwidthResult measurePointerChaseWithLoad(void *data, size_t size,
   }
 
   return {load_bandwidth_gbps, elapsed_ms};
+}
+
+// Phase 3 of the prefetch test: cold sequential read of [data, data+size) that
+// issues a PXL device prefetch `ahead` blocks in front of the current block.
+// ahead == 0 means no prefetch (baseline). Returns the read bandwidth.
+// `chunk_size` is the device-prefetch granularity: each pxl::prefetchMemory
+// call covers one chunk, and prefetch is issued `ahead` chunks in front of the
+// current read position. The read itself is a flat sequential scan and does not
+// depend on the chunk size.
+static BandwidthResult prefetchReadPass(void *data, size_t size, int num_threads,
+                                        bool bypass_cache, int ahead, size_t chunk_size)
+{
+  vector<thread> threads;
+  vector<double> thread_times(num_threads);
+  atomic<bool> start_flag(false);
+  atomic<int> ready_count(0);
+
+  ProgressMonitor progress(size, "PrefetchRead");
+
+  for (int t = 0; t < num_threads; t++)
+  {
+    threads.emplace_back([&, t, bypass_cache, ahead, chunk_size]()
+                         {
+                           if (!g_cpu_affinity_list.empty())
+                           {
+                             int cpu_id = g_cpu_affinity_list[t % g_cpu_affinity_list.size()];
+                             setThreadCpuAffinity(cpu_id);
+                           }
+
+                           size_t per_thread_size = size / num_threads;
+                           int32_t *thread_data =
+                               reinterpret_cast<int32_t *>((char *)data + t * per_thread_size);
+                           size_t per_thread_ints = per_thread_size / sizeof(int32_t);
+                           const size_t chunk_ints = chunk_size / sizeof(int32_t);
+                           const size_t num_full_chunks = per_thread_ints / chunk_ints;
+
+                           // Flush host cache so the read is cold (skip for non-temporal loads)
+                           if (!bypass_cache)
+                           {
+                             flushHostCache(thread_data, per_thread_size);
+                             _mm_mfence();
+                           }
+
+                           ready_count.fetch_add(1);
+                           while (!start_flag.load())
+                           {
+                             this_thread::yield();
+                           }
+
+                           auto thread_start = steady_clock::now();
+
+                           // Warmup: pre-issue device prefetch for the first `ahead` chunks
+                           if (ahead > 0)
+                           {
+                             size_t warmup = std::min((size_t)ahead, num_full_chunks);
+                             for (size_t a = 0; a < warmup; a++)
+                             {
+                               devicePrefetch(reinterpret_cast<char *>(thread_data) + a * chunk_size, chunk_size);
+                             }
+                           }
+
+                           __m256i acc = _mm256_setzero_si256();
+                           size_t local_bytes = 0;
+                           for (size_t chunk = 0; chunk < num_full_chunks; chunk++)
+                           {
+                             // Prefetch the chunk `ahead` chunks in front of the current one
+                             if (ahead > 0)
+                             {
+                               size_t target = chunk + (size_t)ahead;
+                               if (target < num_full_chunks)
+                               {
+                                 devicePrefetch(reinterpret_cast<char *>(thread_data) + target * chunk_size, chunk_size);
+                               }
+                             }
+
+                             const size_t base_ints = chunk * chunk_ints;
+                             for (size_t j = 0; j + 8 <= chunk_ints; j += 8)
+                             {
+                               size_t i = base_ints + j;
+                               __m256i data_vec = bypass_cache
+                                                      ? _mm256_stream_load_si256(
+                                                            reinterpret_cast<__m256i *>(&thread_data[i]))
+                                                      : _mm256_loadu_si256(
+                                                            reinterpret_cast<const __m256i *>(&thread_data[i]));
+                               acc = _mm256_add_epi32(acc, data_vec);
+
+                               local_bytes += 32;
+                               if (local_bytes >= PROGRESS_UPDATE_BYTES)
+                               {
+                                 progress.add_bytes(local_bytes);
+                                 local_bytes = 0;
+                               }
+                             }
+                           }
+
+                           // Drain accumulator so the loads are not optimized away
+                           volatile long long sum = 0;
+                           int32_t temp[8];
+                           _mm256_storeu_si256(reinterpret_cast<__m256i *>(temp), acc);
+                           for (int j = 0; j < 8; j++)
+                             sum += temp[j];
+
+                           size_t i = num_full_chunks * chunk_ints;
+                           for (; i < per_thread_ints; i++)
+                           {
+                             sum += thread_data[i];
+                             local_bytes += 4;
+                           }
+                           progress.add_bytes(local_bytes);
+
+                           auto thread_end = steady_clock::now();
+                           thread_times[t] =
+                               duration_cast<microseconds>(thread_end - thread_start).count() /
+                               1000.0;
+                         });
+  }
+
+  while (ready_count.load() < num_threads)
+  {
+    this_thread::yield();
+  }
+
+  auto start_time = steady_clock::now();
+  start_flag.store(true);
+  progress.wait_until_done();
+  for (auto &th : threads)
+  {
+    th.join();
+  }
+
+  auto end_time = steady_clock::now();
+  double elapsed_ms =
+      duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
+  double bandwidth_gbps =
+      (size / (1000.0 * 1000.0 * 1000.0)) / (elapsed_ms / 1000.0);
+
+  return {bandwidth_gbps, elapsed_ms};
+}
+
+// Explicit-prefetch test (PXL only). See benchmark.h for the region layout.
+// Phase 1: write region A. Phase 2: read region B (evicts A). Phase 3: cold
+// read of A with device prefetch `explicit_prefetch_ahead` blocks ahead — the
+// returned bandwidth is for this phase.
+BandwidthResult measurePrefetchTest(void *data, size_t size, int num_threads,
+                                    bool bypass_cache, int explicit_prefetch_ahead,
+                                    size_t prefetch_chunk_size)
+{
+  // Phases 1 and 2 are just setup (fill region A, evict it via region B), so
+  // they run with a fixed thread count. Only the measured phase 3 uses the
+  // caller-specified num_threads.
+  const int kSetupThreads = 16;
+
+  void *region_a = data;
+  void *region_b = static_cast<char *>(data) + size;
+
+  printf("  [prefetch_test] Phase 1: sequential write to region A (%d threads)...\n",
+         kSetupThreads);
+  measureSequentialWrite(region_a, size, kSetupThreads, bypass_cache);
+
+  printf("  [prefetch_test] Phase 2: sequential read of region B (evict A, %d threads)...\n",
+         kSetupThreads);
+  measureSequentialRead(region_b, size, kSetupThreads, bypass_cache);
+
+  printf("  [prefetch_test] Phase 3: cold read of region A (%d threads, ahead=%d chunks of %zu MiB)...\n",
+         num_threads, explicit_prefetch_ahead, prefetch_chunk_size / (1024 * 1024));
+  return prefetchReadPass(region_a, size, num_threads, bypass_cache,
+                          explicit_prefetch_ahead, prefetch_chunk_size);
 }

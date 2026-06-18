@@ -20,6 +20,9 @@
 #include "hw_prefetcher.h"
 #include "numa_affinity.h"
 #include "output.h"
+
+#include <pxl/memory.hpp>
+
 #ifdef ENABLE_TRACING
 #include "tracing.h"
 #endif
@@ -40,7 +43,7 @@ void printUsage(const char *prog_name)
       "seq,random):\n");
   printf(
       "                                  Detailed: seq_read, seq_write, "
-      "random_read, random_write, stride_read, stride_write, zipfian_read, pointer_chase\n");
+      "random_read, random_write, stride_read, stride_write, zipfian_read, pointer_chase, prefetch_test\n");
   printf(
       "                                  Combined: seq (=seq_read+seq_write), "
       "random, stride, zipfian, all\n");
@@ -64,8 +67,12 @@ void printUsage(const char *prog_name)
   printf("Memory Binding (mutually exclusive):\n");
   printf("  --devdax <device>      DevDAX device path (e.g., /dev/dax0.0)\n");
   printf(
-      "  --offset <bytes>       Start offset for devdax mmap (default: 0)\n");
+      "  --pxl-device <id>      PXL device id (e.g., 0). Allocates via "
+      "pxl::allocateMemory. Required for mode prefetch_test.\n");
   printf("  --membind <node>       NUMA memory node (e.g., 4)\n");
+  printf(
+      "  --offset <bytes>       Start offset for devdax mmap / PXL alloc base "
+      "(default: 0)\n");
   printf("\n");
   printf("CPU Affinity:\n");
   printf(
@@ -76,6 +83,12 @@ void printUsage(const char *prog_name)
   printf(
       "  --prefetch <ON|OFF>    Hardware prefetcher control (optional, "
       "requires Secure Boot disabled)\n");
+  printf(
+      "  --explicit-prefetch-ahead <N>  Device prefetch N chunks ahead in mode "
+      "prefetch_test (0 = baseline, no prefetch)\n");
+  printf(
+      "  --prefetch-chunk-size <bytes>  Size of each device prefetch in mode "
+      "prefetch_test (default: 32 MiB)\n");
   printf(
       "  --bypass-cache         Enable non-temporal loads/stores (cache bypass)\n");
   printf(
@@ -96,8 +109,11 @@ void printUsage(const char *prog_name)
   printf("Examples:\n");
   printf("  sudo %s --mode seq,random --threads 4 --membind 4\n", prog_name);
   printf(
-      "  sudo %s --mode seq_read --threads 128 --prefetch ON --devdax "
-      "/dev/dax0.0\n",
+      "  sudo %s --mode seq_read --threads 128 --prefetch ON --pxl-device 0\n",
+      prog_name);
+  printf(
+      "  sudo %s --mode prefetch_test --threads 64 --pxl-device 0 "
+      "--explicit-prefetch-ahead 8\n",
       prog_name);
   printf(
       "  sudo %s --mode stride_read,stride_write --threads 64 --stride-size "
@@ -130,8 +146,11 @@ int main(int argc, char *argv[])
   uint64_t inject_delay_cycles =
       0;                        // Inject delay for pointer chase (default: 0)
   bool use_hugepage = false;    // Use 2MB huge pages for allocation
-  size_t devdax_offset = 0;     // Offset for devdax mmap (default: 0)
+  size_t mem_offset = 0;        // Start offset for PXL alloc base (default: 0)
   double zipfian_alpha = 0.99;  // Zipfian skew parameter (default: 0.99, YCSB)
+  int explicit_prefetch_ahead = 0;  // 0 = disabled, >0 = chunks ahead to prefetch
+  size_t prefetch_chunk_size = 32ULL * 1024 * 1024; // prefetch granularity (default 32 MiB)
+  int pxl_device_id = -1;       // -1 = not using PXL; >=0 = PXL device id
 
   // Setup signal handlers for cleanup
   signal(SIGINT, signal_handler);
@@ -275,7 +294,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Error: --offset requires a value\n");
         return 1;
       }
-      devdax_offset = strtoull(argv[++i], nullptr, 0);
+      mem_offset = strtoull(argv[++i], nullptr, 0);
     }
     else if (strcmp(argv[i], "--zipfian-alpha") == 0)
     {
@@ -288,6 +307,48 @@ int main(int argc, char *argv[])
       if (zipfian_alpha <= 0)
       {
         fprintf(stderr, "Error: --zipfian-alpha must be greater than 0\n");
+        return 1;
+      }
+    }
+    else if (strcmp(argv[i], "--explicit-prefetch-ahead") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        fprintf(stderr, "Error: --explicit-prefetch-ahead requires a value\n");
+        return 1;
+      }
+      explicit_prefetch_ahead = atoi(argv[++i]);
+      if (explicit_prefetch_ahead < 0)
+      {
+        fprintf(stderr, "Error: --explicit-prefetch-ahead must be >= 0\n");
+        return 1;
+      }
+    }
+    else if (strcmp(argv[i], "--prefetch-chunk-size") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        fprintf(stderr, "Error: --prefetch-chunk-size requires a value\n");
+        return 1;
+      }
+      prefetch_chunk_size = strtoull(argv[++i], nullptr, 0);
+      if (prefetch_chunk_size < 32 || prefetch_chunk_size % 32 != 0)
+      {
+        fprintf(stderr, "Error: --prefetch-chunk-size must be a multiple of 32 bytes\n");
+        return 1;
+      }
+    }
+    else if (strcmp(argv[i], "--pxl-device") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        fprintf(stderr, "Error: --pxl-device requires a value\n");
+        return 1;
+      }
+      pxl_device_id = atoi(argv[++i]);
+      if (pxl_device_id < 0)
+      {
+        fprintf(stderr, "Error: --pxl-device must be >= 0\n");
         return 1;
       }
     }
@@ -304,17 +365,24 @@ int main(int argc, char *argv[])
     }
   }
 
-  // Validate devdax and membind are mutually exclusive
-  if (devdax_path && membind_node >= 0)
+  // Memory sources are mutually exclusive: --devdax / --membind / --pxl-device
   {
-    fprintf(stderr, "Error: --devdax and --membind cannot be used together\n");
-    return 1;
-  }
-
-  if (!devdax_path && membind_node < 0)
-  {
-    fprintf(stderr, "Error: You must specify either --devdax or --membind\n");
-    return 1;
+    int source_count = 0;
+    if (devdax_path) source_count++;
+    if (membind_node >= 0) source_count++;
+    if (pxl_device_id >= 0) source_count++;
+    if (source_count > 1)
+    {
+      fprintf(stderr,
+              "Error: --devdax, --membind, --pxl-device are mutually exclusive\n");
+      return 1;
+    }
+    if (source_count == 0)
+    {
+      fprintf(stderr,
+              "Error: You must specify one of --devdax, --membind, --pxl-device\n");
+      return 1;
+    }
   }
 
   // Set default memory per thread if not specified
@@ -344,13 +412,14 @@ int main(int argc, char *argv[])
           token != "random_read" && token != "random_write" &&
           token != "stride_read" && token != "stride_write" &&
           token != "pointer_chase" &&
-          token != "zipfian" && token != "zipfian_read")
+          token != "zipfian" && token != "zipfian_read" &&
+          token != "prefetch_test")
       {
         fprintf(stderr, "Error: Invalid mode '%s'\n", token.c_str());
         fprintf(stderr,
                 "Valid modes: seq_read, seq_write, random_read, random_write, "
-                "stride_read, stride_write, zipfian_read, pointer_chase, seq, "
-                "random, stride, zipfian, all\n");
+                "stride_read, stride_write, zipfian_read, pointer_chase, "
+                "prefetch_test, seq, random, stride, zipfian, all\n");
         return 1;
       }
       modes.push_back(token);
@@ -400,6 +469,19 @@ int main(int argc, char *argv[])
       // Already a detailed mode (seq_read, seq_write, etc.)
       expanded_modes.push_back(m);
     }
+  }
+
+  // The prefetch_test mode is PXL-only (it relies on pxl::prefetchMemory) and
+  // needs a double-sized allocation (region A + region B).
+  bool mode_has_prefetch_test = false;
+  for (const auto &m : expanded_modes)
+  {
+    if (m == "prefetch_test") mode_has_prefetch_test = true;
+  }
+  if (mode_has_prefetch_test && pxl_device_id < 0)
+  {
+    fprintf(stderr, "Error: mode prefetch_test requires --pxl-device\n");
+    return 1;
   }
 
   // Validate num_threads
@@ -534,10 +616,13 @@ int main(int argc, char *argv[])
   int total_memory_mib = memory_per_thread_mib * num_threads;
   size_t memory_size = (size_t)total_memory_mib * 1024 * 1024;
 
-  // Allocate memory (either devdax mmap or system memory)
+  // Allocate memory (devdax mmap, pxl device alloc, or system memory).
+  // prefetch_test needs region A + region B, so it doubles the allocation.
   void *data;
   int devdax_fd = -1;
   bool using_devdax = (devdax_path != nullptr);
+  bool using_pxl = (pxl_device_id >= 0);
+  size_t alloc_size = mode_has_prefetch_test ? 2 * memory_size : memory_size;
 
   if (using_devdax)
   {
@@ -553,18 +638,36 @@ int main(int argc, char *argv[])
 
     // DevDAX doesn't support MAP_HUGETLB flag - it uses huge pages internally
     // based on namespace alignment settings (configured via ndctl)
-    data = mmap(NULL, memory_size, PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_POPULATE, devdax_fd, devdax_offset);
+    data = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_POPULATE, devdax_fd, mem_offset);
     if (data == MAP_FAILED)
     {
-      fprintf(stderr, "Error: Failed to mmap %d MiB from %s: %s\n",
-              total_memory_mib, devdax_path, strerror(errno));
+      fprintf(stderr, "Error: Failed to mmap %zu bytes from %s: %s\n",
+              alloc_size, devdax_path, strerror(errno));
       close(devdax_fd);
       restore_prefetcher_state();
       return 1;
     }
     printf("Using devdax device: %s (offset: %zu bytes, 0x%zx)\n", devdax_path,
-           devdax_offset, devdax_offset);
+           mem_offset, mem_offset);
+  }
+  else if (using_pxl)
+  {
+    // PXL owns the allocation. With offset > 0 we allocate (offset + size) and
+    // address `offset` bytes into it (--offset selects the base within the device).
+    void *pxl_base =
+        pxl::allocateMemory((uint32_t)pxl_device_id, mem_offset + alloc_size);
+    if (pxl_base == nullptr)
+    {
+      fprintf(stderr,
+              "Error: pxl::allocateMemory failed (deviceId=%d, size=%zu bytes)\n",
+              pxl_device_id, mem_offset + alloc_size);
+      restore_prefetcher_state();
+      return 1;
+    }
+    data = static_cast<char *>(pxl_base) + mem_offset;
+    printf("Using PXL device %d (offset: %zu bytes, 0x%zx; allocated %zu MiB)\n",
+           pxl_device_id, mem_offset, mem_offset, alloc_size / (1024 * 1024));
   }
   else if (membind_node >= 0)
   {
@@ -631,12 +734,18 @@ int main(int argc, char *argv[])
 
   printf("Memory allocated successfully\n\n");
 
+  if (explicit_prefetch_ahead > 0)
+  {
+    printf("Explicit PXL prefetch enabled: ahead=%d chunks of %zu MiB\n",
+           explicit_prefetch_ahead, prefetch_chunk_size / (1024 * 1024));
+  }
+
   // Set global CPU affinity list for benchmark threads
   g_cpu_affinity_list = cpu_list;
 
   // Save environment configuration
   saveEnvironmentJson(result_dir, mode, BLOCK_SIZE, STRIDE_SIZE, bypass_cache,
-                      devdax_path);
+                      devdax_path, pxl_device_id);
 
 #ifdef ENABLE_TRACING
   // Create tracing directory structure
@@ -651,8 +760,11 @@ int main(int argc, char *argv[])
   bool run_stride_read = false, run_stride_write = false;
   bool run_pointer_chase = false;
   bool run_zipfian_read = false;
+  bool run_prefetch_test = false;
   for (const auto &m : expanded_modes)
   {
+    if (m == "prefetch_test")
+      run_prefetch_test = true;
     if (m == "seq_read")
       run_seq_read = true;
     if (m == "seq_write")
@@ -698,8 +810,16 @@ int main(int argc, char *argv[])
             output_file_path_buf);
     if (using_devdax)
     {
-      munmap(data, memory_size);
+      munmap(data, alloc_size);
       close(devdax_fd);
+    }
+    else if (using_pxl)
+    {
+      pxl::releaseMemory(static_cast<char *>(data) - mem_offset);
+    }
+    else if (membind_node >= 0)
+    {
+      numa_free(data, memory_size);
     }
     else
     {
@@ -745,6 +865,10 @@ int main(int argc, char *argv[])
     {
       fprintf(output_file, " PointerChase(GB/s)");
     }
+    if (run_prefetch_test)
+    {
+      fprintf(output_file, " PrefetchTest(GB/s)");
+    }
     fprintf(output_file, "\n");
   }
 
@@ -761,6 +885,7 @@ int main(int argc, char *argv[])
   double stride_read_bw = 0, stride_write_bw = 0;
   double zipfian_read_bw = 0;
   double pointer_chase_bw = 0;
+  double prefetch_test_bw = 0;
 
   if (run_seq_read || run_seq_write)
   {
@@ -1006,6 +1131,20 @@ int main(int argc, char *argv[])
     printf("\n");
   }
 
+  if (run_prefetch_test)
+  {
+    printf("[Prefetch Test (PXL, ahead=%d chunks of %zu MiB)]\n",
+           explicit_prefetch_ahead, prefetch_chunk_size / (1024 * 1024));
+    printf("Running Prefetch Test...\n");
+    auto prefetch_test_result = measurePrefetchTest(
+        data, memory_to_use, num_threads, bypass_cache, explicit_prefetch_ahead,
+        prefetch_chunk_size);
+    prefetch_test_bw = prefetch_test_result.bandwidth_gbps;
+    printf("Phase 3 Read Bandwidth: %.2f GB/s (%.2f ms)\n",
+           prefetch_test_result.bandwidth_gbps, prefetch_test_result.elapsed_ms);
+    printf("\n");
+  }
+
   // Write results (space-separated)
   fprintf(output_file, "%d", num_threads);
   if (run_seq_read)
@@ -1040,6 +1179,10 @@ int main(int argc, char *argv[])
   {
     fprintf(output_file, " %.2f", pointer_chase_bw);
   }
+  if (run_prefetch_test)
+  {
+    fprintf(output_file, " %.2f", prefetch_test_bw);
+  }
   fprintf(output_file, "\n");
   fflush(output_file);
 
@@ -1069,9 +1212,15 @@ int main(int argc, char *argv[])
   // Free memory
   if (using_devdax)
   {
-    munmap(data, memory_size);
+    munmap(data, alloc_size);
     close(devdax_fd);
     printf("Memory unmapped from devdax device\n");
+  }
+  else if (using_pxl)
+  {
+    // Recover the allocation base (we addressed mem_offset bytes in).
+    pxl::releaseMemory(static_cast<char *>(data) - mem_offset);
+    printf("Memory released (PXL device %d)\n", pxl_device_id);
   }
   else if (membind_node >= 0)
   {

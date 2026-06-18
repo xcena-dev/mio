@@ -25,6 +25,16 @@ if(ENABLE_LATENCY_MEASURE)
     list(APPEND src src/latency_measure.cpp)
 endif()
 
+# The pxl library is required (libpxl + pxl/memory.hpp). The build fails if
+# it is missing — PXL is the device memory source and prefetch backend.
+find_library(PXL_LIB pxl PATHS /usr/local/lib NO_DEFAULT_PATH)
+find_path(PXL_MEMORY_INC pxl/memory.hpp PATHS /usr/local/include NO_DEFAULT_PATH)
+
+if(NOT (PXL_LIB AND PXL_MEMORY_INC))
+    message(FATAL_ERROR "pxl library not found: need libpxl in /usr/local/lib and pxl/memory.hpp in /usr/local/include")
+endif()
+message(STATUS "PXL: ${PXL_LIB} (include: ${PXL_MEMORY_INC})")
+
 set(include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -66,6 +76,10 @@ target_link_libraries(${target}
     -Wl,--whole-archive ${static_libs} -Wl,--no-whole-archive
     ${shared_libs}
 )
+
+# Wire up the required PXL library
+target_include_directories(${target} PRIVATE ${PXL_MEMORY_INC})
+target_link_libraries(${target} ${PXL_LIB})
 
 message(STATUS "Project: ${PROJECT_NAME}")
 message(STATUS "  Target: ${target}")

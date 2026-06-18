@@ -35,6 +35,17 @@ BandwidthResult measureSequentialWrite(void* data, size_t size, int num_threads,
 BandwidthResult measureRandomRead(void* data, size_t size, int num_threads, bool bypass_cache = false);
 BandwidthResult measureRandomWrite(void* data, size_t size, int num_threads, bool bypass_cache = false);
 
+// Explicit-prefetch test (PXL only). `data` must point to a buffer of at least
+// 2*size bytes laid out as region A = [data, data+size) and region B =
+// [data+size, data+2*size). The test runs three phases:
+//   1. sequential write over region A
+//   2. sequential read over region B (evicts region A from cache)
+//   3. sequential read over region A, issuing a device prefetch
+//      `explicit_prefetch_ahead` chunks ahead (0 = no prefetch). Each prefetch
+//      covers `prefetch_chunk_size` bytes; the read is a flat sequential scan.
+// The returned bandwidth is for phase 3 (the cold, prefetched read of A).
+BandwidthResult measurePrefetchTest(void* data, size_t size, int num_threads, bool bypass_cache, int explicit_prefetch_ahead, size_t prefetch_chunk_size);
+
 // Stride access measurements
 BandwidthResult measureStrideRead(void* data, size_t size, int num_threads, size_t stride, bool bypass_cache = false);
 BandwidthResult measureStrideWrite(void* data, size_t size, int num_threads, size_t stride, bool bypass_cache = false);

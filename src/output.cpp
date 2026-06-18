@@ -8,7 +8,8 @@
 using namespace std;
 
 void saveEnvironmentJson(const char* result_dir, const string& mode, size_t block_size,
-                         size_t stride_size, bool bypass_cache, const char* devdax_path) {
+                         size_t stride_size, bool bypass_cache, const char* devdax_path,
+                         int pxl_device_id) {
     char filepath[1024];
     snprintf(filepath, sizeof(filepath), "%s/environment.json", result_dir);
 
@@ -71,11 +72,17 @@ void saveEnvironmentJson(const char* result_dir, const string& mode, size_t bloc
         fprintf(fp, "  \"stride_size\": null,\n");
     }
     fprintf(fp, "  \"bypass_cache\": %s,\n", bypass_cache ? "true" : "false");
-    fprintf(fp, "  \"memory_type\": \"%s\",\n", devdax_path ? "devdax" : "numa");
+    const char* mem_type = devdax_path ? "devdax" : (pxl_device_id >= 0 ? "pxl" : "numa");
+    fprintf(fp, "  \"memory_type\": \"%s\",\n", mem_type);
     if (devdax_path) {
         fprintf(fp, "  \"devdax_device\": \"%s\",\n", devdax_path);
     } else {
         fprintf(fp, "  \"devdax_device\": null,\n");
+    }
+    if (pxl_device_id >= 0) {
+        fprintf(fp, "  \"pxl_device\": %d,\n", pxl_device_id);
+    } else {
+        fprintf(fp, "  \"pxl_device\": null,\n");
     }
     fprintf(fp, "  \"system_info\": {\n");
     fprintf(fp, "    \"hostname\": \"%s\",\n", hostname);
