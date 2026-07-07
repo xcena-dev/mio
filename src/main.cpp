@@ -708,11 +708,11 @@ int main(int argc, char *argv[])
     fprintf(output_file, "# Threads");
     if (run_seq_read)
     {
-      fprintf(output_file, " SeqRead(GB/s)");
+      fprintf(output_file, " SeqRead(GB/s) SeqRead(ms)");
     }
     if (run_seq_write)
     {
-      fprintf(output_file, " SeqWrite(GB/s)");
+      fprintf(output_file, " SeqWrite(GB/s) SeqWrite(ms)");
     }
     if (run_random_read)
     {
@@ -754,6 +754,10 @@ int main(int argc, char *argv[])
   double stride_read_bw = 0, stride_write_bw = 0;
   double zipfian_read_bw = 0;
   double pointer_chase_bw = 0;
+  // Elapsed wall-clock (ms) for the sequential modes, persisted alongside GB/s so
+  // callers can use mio's measured time instead of back-deriving it from the
+  // 2-decimal GB/s (which loses precision).
+  double seq_read_ms = 0, seq_write_ms = 0;
 
   if (run_seq_read || run_seq_write)
   {
@@ -773,6 +777,7 @@ int main(int argc, char *argv[])
     auto seq_read_result =
         measureSequentialRead(data, memory_to_use, num_threads, bypass_cache);
     seq_read_bw = seq_read_result.bandwidth_gbps;
+    seq_read_ms = seq_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            seq_read_result.bandwidth_gbps, seq_read_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -803,6 +808,7 @@ int main(int argc, char *argv[])
     auto seq_write_result =
         measureSequentialWrite(data, memory_to_use, num_threads, bypass_cache);
     seq_write_bw = seq_write_result.bandwidth_gbps;
+    seq_write_ms = seq_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            seq_write_result.bandwidth_gbps, seq_write_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -1003,11 +1009,11 @@ int main(int argc, char *argv[])
   fprintf(output_file, "%d", num_threads);
   if (run_seq_read)
   {
-    fprintf(output_file, " %.2f", seq_read_bw);
+    fprintf(output_file, " %.2f %.2f", seq_read_bw, seq_read_ms);
   }
   if (run_seq_write)
   {
-    fprintf(output_file, " %.2f", seq_write_bw);
+    fprintf(output_file, " %.2f %.2f", seq_write_bw, seq_write_ms);
   }
   if (run_random_read)
   {

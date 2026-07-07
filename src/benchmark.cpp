@@ -301,9 +301,12 @@ BandwidthResult measureSequentialRead(void *data, size_t size,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
   double bandwidth_gbps =
@@ -446,9 +449,12 @@ BandwidthResult measureSequentialWrite(void *data, size_t size, int num_threads,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
   double bandwidth_gbps =
@@ -639,9 +645,12 @@ BandwidthResult measureRandomRead(void *data, size_t size, int num_threads,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
   double bandwidth_gbps =
@@ -785,9 +794,12 @@ BandwidthResult measureRandomWrite(void *data, size_t size, int num_threads,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
   double bandwidth_gbps =
@@ -986,9 +998,12 @@ BandwidthResult measureZipfianRead(void *data, size_t size, int num_threads,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
   double bandwidth_gbps =
@@ -1128,9 +1143,12 @@ BandwidthResult measureStrideRead(void *data, size_t size, int num_threads,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
 
@@ -1277,9 +1295,12 @@ BandwidthResult measureStrideWrite(void *data, size_t size, int num_threads,
   {
     th.join();
   }
-  progress.stop();
-
+  // Stop the wall-clock BEFORE tearing down the progress monitor. progress.stop()
+  // joins the monitor thread, which may be mid sleep_for(1000ms); that join would
+  // otherwise add up to ~1s of non-work time to elapsed and quantize the reported
+  // bandwidth to integer-second buckets.
   auto end_time = steady_clock::now();
+  progress.stop();
   double elapsed_ms =
       duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
 
