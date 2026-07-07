@@ -715,35 +715,35 @@ int main(int argc, char *argv[])
     fprintf(output_file, "# Threads");
     if (run_seq_read)
     {
-      fprintf(output_file, " SeqRead(GB/s)");
+      fprintf(output_file, " SeqRead(GB/s) SeqRead(ms)");
     }
     if (run_seq_write)
     {
-      fprintf(output_file, " SeqWrite(GB/s)");
+      fprintf(output_file, " SeqWrite(GB/s) SeqWrite(ms)");
     }
     if (run_random_read)
     {
-      fprintf(output_file, " RandRead(GB/s)");
+      fprintf(output_file, " RandRead(GB/s) RandRead(ms)");
     }
     if (run_random_write)
     {
-      fprintf(output_file, " RandWrite(GB/s)");
+      fprintf(output_file, " RandWrite(GB/s) RandWrite(ms)");
     }
     if (run_stride_read)
     {
-      fprintf(output_file, " StrideRead(GB/s)");
+      fprintf(output_file, " StrideRead(GB/s) StrideRead(ms)");
     }
     if (run_stride_write)
     {
-      fprintf(output_file, " StrideWrite(GB/s)");
+      fprintf(output_file, " StrideWrite(GB/s) StrideWrite(ms)");
     }
     if (run_zipfian_read)
     {
-      fprintf(output_file, " ZipfianRead(GB/s)");
+      fprintf(output_file, " ZipfianRead(GB/s) ZipfianRead(ms)");
     }
     if (run_pointer_chase)
     {
-      fprintf(output_file, " PointerChase(GB/s)");
+      fprintf(output_file, " PointerChase(GB/s) PointerChase(ms)");
     }
     fprintf(output_file, "\n");
   }
@@ -758,9 +758,13 @@ int main(int argc, char *argv[])
       (size_t)num_threads * memory_per_thread_mib * 1024 * 1024;
 
   double seq_read_bw = 0, seq_write_bw = 0, rand_read_bw = 0, rand_write_bw = 0;
+  double seq_read_ms = 0, seq_write_ms = 0, rand_read_ms = 0, rand_write_ms = 0;
   double stride_read_bw = 0, stride_write_bw = 0;
+  double stride_read_ms = 0, stride_write_ms = 0;
   double zipfian_read_bw = 0;
+  double zipfian_read_ms = 0;
   double pointer_chase_bw = 0;
+  double pointer_chase_ms = 0;
 
   if (run_seq_read || run_seq_write)
   {
@@ -780,6 +784,7 @@ int main(int argc, char *argv[])
     auto seq_read_result =
         measureSequentialRead(data, memory_to_use, num_threads, bypass_cache);
     seq_read_bw = seq_read_result.bandwidth_gbps;
+    seq_read_ms = seq_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            seq_read_result.bandwidth_gbps, seq_read_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -810,6 +815,7 @@ int main(int argc, char *argv[])
     auto seq_write_result =
         measureSequentialWrite(data, memory_to_use, num_threads, bypass_cache);
     seq_write_bw = seq_write_result.bandwidth_gbps;
+    seq_write_ms = seq_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            seq_write_result.bandwidth_gbps, seq_write_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -843,6 +849,7 @@ int main(int argc, char *argv[])
 #endif
     auto rand_read_result = measureRandomRead(data, memory_to_use, num_threads, bypass_cache);
     rand_read_bw = rand_read_result.bandwidth_gbps;
+    rand_read_ms = rand_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            rand_read_result.bandwidth_gbps, rand_read_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -873,6 +880,7 @@ int main(int argc, char *argv[])
     auto rand_write_result =
         measureRandomWrite(data, memory_to_use, num_threads, bypass_cache);
     rand_write_bw = rand_write_result.bandwidth_gbps;
+    rand_write_ms = rand_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            rand_write_result.bandwidth_gbps, rand_write_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -902,6 +910,7 @@ int main(int argc, char *argv[])
 #endif
     auto zipfian_read_result = measureZipfianRead(data, memory_to_use, num_threads, zipfian_alpha, bypass_cache);
     zipfian_read_bw = zipfian_read_result.bandwidth_gbps;
+    zipfian_read_ms = zipfian_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            zipfian_read_result.bandwidth_gbps, zipfian_read_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -939,6 +948,7 @@ int main(int argc, char *argv[])
     auto stride_read_result =
         measureStrideRead(data, memory_to_use, num_threads, STRIDE_SIZE, bypass_cache);
     stride_read_bw = stride_read_result.bandwidth_gbps;
+    stride_read_ms = stride_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            stride_read_result.bandwidth_gbps, stride_read_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -960,6 +970,7 @@ int main(int argc, char *argv[])
     auto stride_write_result = measureStrideWrite(
         data, memory_to_use, num_threads, STRIDE_SIZE, bypass_cache);
     stride_write_bw = stride_write_result.bandwidth_gbps;
+    stride_write_ms = stride_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            stride_write_result.bandwidth_gbps, stride_write_result.elapsed_ms);
 #ifdef ENABLE_TRACING
@@ -991,6 +1002,7 @@ int main(int argc, char *argv[])
     auto pointer_chase_result = measurePointerChaseWithLoad(
         data, memory_to_use, num_threads, inject_delay_cycles, membind_node);
     pointer_chase_bw = pointer_chase_result.bandwidth_gbps;
+    pointer_chase_ms = pointer_chase_result.elapsed_ms;
     printf("Load Bandwidth: %.2f GB/s (%.2f ms)\n",
            pointer_chase_result.bandwidth_gbps,
            pointer_chase_result.elapsed_ms);
@@ -1010,35 +1022,35 @@ int main(int argc, char *argv[])
   fprintf(output_file, "%d", num_threads);
   if (run_seq_read)
   {
-    fprintf(output_file, " %.2f", seq_read_bw);
+    fprintf(output_file, " %.2f %.2f", seq_read_bw, seq_read_ms);
   }
   if (run_seq_write)
   {
-    fprintf(output_file, " %.2f", seq_write_bw);
+    fprintf(output_file, " %.2f %.2f", seq_write_bw, seq_write_ms);
   }
   if (run_random_read)
   {
-    fprintf(output_file, " %.2f", rand_read_bw);
+    fprintf(output_file, " %.2f %.2f", rand_read_bw, rand_read_ms);
   }
   if (run_random_write)
   {
-    fprintf(output_file, " %.2f", rand_write_bw);
+    fprintf(output_file, " %.2f %.2f", rand_write_bw, rand_write_ms);
   }
   if (run_stride_read)
   {
-    fprintf(output_file, " %.2f", stride_read_bw);
+    fprintf(output_file, " %.2f %.2f", stride_read_bw, stride_read_ms);
   }
   if (run_stride_write)
   {
-    fprintf(output_file, " %.2f", stride_write_bw);
+    fprintf(output_file, " %.2f %.2f", stride_write_bw, stride_write_ms);
   }
   if (run_zipfian_read)
   {
-    fprintf(output_file, " %.2f", zipfian_read_bw);
+    fprintf(output_file, " %.2f %.2f", zipfian_read_bw, zipfian_read_ms);
   }
   if (run_pointer_chase)
   {
-    fprintf(output_file, " %.2f", pointer_chase_bw);
+    fprintf(output_file, " %.2f %.2f", pointer_chase_bw, pointer_chase_ms);
   }
   fprintf(output_file, "\n");
   fflush(output_file);
