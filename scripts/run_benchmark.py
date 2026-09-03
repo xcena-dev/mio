@@ -9,9 +9,17 @@ Usage:
   python3 run_benchmark.py --membind 4 --small-mem            # small memory only (cache hit)
   python3 run_benchmark.py --devdax /dev/dax0.0 4        # quick mode
 
+Threads:
+  Fixed at 8 (see THREADS). The memory presets below are per-thread sizes
+  chosen for that count, so the totals stay at 1 TiB / 64 GiB:
+    large = 131072 x 8 = 1 TiB      small = 8192 x 8 = 64 GiB
+
 Cache behavior:
-  --large-mem (65536 MiB/thread):  Dummy read uses large offset -> cache flush (miss)
-  --small-mem (4096 MiB/thread):   Dummy read uses offset 0     -> cache warmup (hit)
+  --large-mem (131072 MiB/thread): Dummy read uses large offset -> cache flush (miss)
+  --small-mem (8192 MiB/thread):   Dummy read uses offset 0     -> cache warmup (hit)
+
+  A large-mem *write* bench flushes with a write instead of a read, so the
+  device DRAM cache is left dirty — see flush_stages().
 
 Repetition:
   Only the small (cache-hit) region is jittery, so it runs NUM_SETS
@@ -44,8 +52,10 @@ MICROBENCH = REPO_ROOT / "build" / "microbench"
 SUMMARY_DIR = REPO_ROOT / "summary"
 RESULT_DIR = REPO_ROOT / "result"
 
-LARGE_MEM = 65536  # MiB per thread, cache-miss scenario
-SMALL_MEM = 4096   # MiB per thread, cache-hit scenario
+THREADS = 8         # fixed; the memory presets below are sized for this
+
+LARGE_MEM = 131072  # MiB per thread, cache-miss scenario  (x8 = 1 TiB)
+SMALL_MEM = 8192    # MiB per thread, cache-hit scenario   (x8 = 64 GiB)
 MEMORY_PER_THREAD = [LARGE_MEM, SMALL_MEM]
 
 BLOCK_SIZES = [524288, 1048576, 2097152]
@@ -120,7 +130,7 @@ def build_cmd(mode: str, memory_per_thread: int, mem_args: list[str],
         "sudo", str(MICROBENCH),
         "--mode", mode,
         "--memory-per-thread", str(memory_per_thread),
-        "--threads", "16",
+        "--threads", str(THREADS),
         *mem_args,
         "--offset", offset,
     ]
@@ -129,6 +139,11 @@ def build_cmd(mode: str, memory_per_thread: int, mem_args: list[str],
     if result_dir:
         cmd += ["--result-dir", str(result_dir)]
     return cmd
+
+
+def flush_stages(mem_size: int, is_write: bool) -> list[tuple[str, str, int, str]]:
+    mode = "seq_write" if is_write else "seq_read"
+    return [("flush", mode, mem_size, FLUSH_OFFSET)]
 
 
 def run_init(base_result_dir: Path, memory_per_thread: int, mem_args: list[str]):
@@ -183,9 +198,9 @@ def parse_args():
 
     size_group = parser.add_mutually_exclusive_group()
     size_group.add_argument("--small-mem", action="store_true",
-                            help=f"{SMALL_MEM} MiB/thread x 16 threads — cache hit scenario")
+                            help=f"{SMALL_MEM} MiB/thread x {THREADS} threads — cache hit scenario")
     size_group.add_argument("--large-mem", action="store_true",
-                            help=f"{LARGE_MEM} MiB/thread x 16 threads — cache miss scenario")
+                            help=f"{LARGE_MEM} MiB/thread x {THREADS} threads — cache miss scenario")
 
     parser.add_argument("--no-init", action="store_true",
                         help="Skip initial seq_write (memory already initialized)")
@@ -232,6 +247,7 @@ def main():
     print(f"Memory target: {mem_target}")
     print(f"Base results directory: {base_result_dir}")
     print(f"Summary file: {summary_file}")
+    print(f"Threads: {THREADS}")
     print(f"Memory per thread sizes: {memory_sizes}")
     print(f"Modes per memory size: {total_modes}  "
           f"(small={NUM_SETS} sets/median, large=1 set)")
@@ -255,13 +271,15 @@ def main():
         # Only the small (cache-hit) region is jittery, so repeat + median there.
         # Large region is stable, so a single set is enough.
         num_sets = NUM_SETS if cache_hit else 1
-        dummy_tag = "warmup" if cache_hit else "flush"
-        dummy_offset = "0x0" if cache_hit else FLUSH_OFFSET
         results[mem_size] = []
 
         for mode_idx, (mode, block_size) in enumerate(tests, start=1):
             mode_label = mode + (f"_bs{block_size}" if block_size else "")
             mode_dir = result_dir / f"{mode_idx:02d}_{mode_label}"
+            if cache_hit:
+                dummy_steps = [("warmup", "seq_read", mem_size, "0x0")]
+            else:
+                dummy_steps = flush_stages(mem_size, "write" in mode)
 
             print(f"\n{'#'*60}")
             print(f"  Mode {mode_idx}/{total_modes}: {mode_label}  ({num_sets} sets)")
@@ -269,18 +287,19 @@ def main():
 
             bws: list[float] = []
             for set_idx in range(1, num_sets + 1):
-                # warmup (cache_hit) or flush (cache_miss) dummy
-                dummy_dir = mode_dir / f"set{set_idx}_{dummy_tag}"
-                dummy_cmd = build_cmd("seq_read", mem_size, mem_args,
-                                      dummy_offset, None, dummy_dir)
-                ok, _ = run_step(
-                    dummy_cmd,
-                    f"[{dummy_tag.upper()}] mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{num_sets}",
-                    dummy_dir,
-                )
-                if not ok:
-                    print(f"\n{mode_label} set{set_idx} {dummy_tag} failed. Aborting.")
-                    sys.exit(1)
+                # warmup (cache_hit) or flush (cache_miss) dummies
+                for tag, dummy_mode, dummy_mem, dummy_offset in dummy_steps:
+                    dummy_dir = mode_dir / f"set{set_idx}_{tag}"
+                    dummy_cmd = build_cmd(dummy_mode, dummy_mem, mem_args,
+                                          dummy_offset, None, dummy_dir)
+                    ok, _ = run_step(
+                        dummy_cmd,
+                        f"[{tag.upper()}] mode {mode_idx}/{total_modes} {mode_label}  set {set_idx}/{num_sets}",
+                        dummy_dir,
+                    )
+                    if not ok:
+                        print(f"\n{mode_label} set{set_idx} {tag} failed. Aborting.")
+                        sys.exit(1)
 
                 # bench
                 bench_dir = mode_dir / f"set{set_idx}_bench"

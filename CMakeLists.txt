@@ -13,6 +13,7 @@ set(src
     src/hw_prefetcher.cpp
     src/output.cpp
     src/numa_affinity.cpp
+    src/thread_tracer.cpp
 )
 
 # Add tracing source if enabled

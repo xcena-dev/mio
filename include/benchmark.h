@@ -5,46 +5,48 @@
 #include <cstdint>
 #include <vector>
 
-// Bandwidth measurement result
+struct RegionBreakdown {
+    double head_gbps, steady_gbps, tail_gbps;
+    double head_ms, steady_ms, tail_ms;
+    double head_bytes, steady_bytes, tail_bytes;
+    bool valid;
+};
+
 struct BandwidthResult {
     double bandwidth_gbps;
     double elapsed_ms;
+    RegionBreakdown regions;
 };
 
-// Global configuration for block and stride sizes
-extern size_t BLOCK_SIZE;   // Default: 64 bytes (used in random and stride patterns)
-extern size_t STRIDE_SIZE;  // Default: 64 bytes
+extern size_t BLOCK_SIZE;
+extern size_t STRIDE_SIZE;
 
-// Global CPU affinity list (empty means no affinity)
 extern std::vector<int> g_cpu_affinity_list;
 
-// When false, ProgressMonitor::wait_until_done returns immediately and no
-// progress lines are printed. Main thread relies on the subsequent join()
-// to block until workers finish, so elapsed_ms isn't padded by polling.
-// Set via --no-progress for sweep runs that want minimum measurement noise.
 extern bool g_progress_enabled;
 
-// Cache flush function
+extern const char *g_thread_trace_dir;
+
+extern int g_thread_trace_interval_ms;
+
+extern bool g_detail_enabled;
+
+extern double g_steady_lo_frac;
+extern double g_steady_hi_frac;
+
 void flushHostCache(void *hostVirtualPtr, size_t size);
 
-// Sequential access measurements
 BandwidthResult measureSequentialRead(void* data, size_t size, int num_threads, bool bypass_cache = false);
 BandwidthResult measureSequentialWrite(void* data, size_t size, int num_threads, bool bypass_cache = false);
 
-// Random access measurements
 BandwidthResult measureRandomRead(void* data, size_t size, int num_threads, bool bypass_cache = false);
 BandwidthResult measureRandomWrite(void* data, size_t size, int num_threads, bool bypass_cache = false);
 
-// Stride access measurements
 BandwidthResult measureStrideRead(void* data, size_t size, int num_threads, size_t stride, bool bypass_cache = false);
 BandwidthResult measureStrideWrite(void* data, size_t size, int num_threads, size_t stride, bool bypass_cache = false);
 
-// Zipfian access measurements
 BandwidthResult measureZipfianRead(void* data, size_t size, int num_threads, double zipfian_alpha = 0.99, bool bypass_cache = false);
 
-// Pointer chase with load measurements
-// membind_node: NUMA node where data is allocated (-1 for devdax/default)
-//               Used to allocate auxiliary arrays on a different node to avoid BW contention
 BandwidthResult measurePointerChaseWithLoad(void* data, size_t size, int num_load_threads, uint64_t inject_delay_cycles, int membind_node = -1);
 
-#endif // BENCHMARK_H
+#endif

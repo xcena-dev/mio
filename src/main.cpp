@@ -30,6 +30,34 @@
 
 using namespace std;
 
+static void printDetail(const BandwidthResult &r)
+{
+  if (!g_detail_enabled)
+    return;
+  const RegionBreakdown &g = r.regions;
+  auto line = [](const char *name, const char *span, double gbps, double bytes,
+                 double ms)
+  {
+    printf("  %-6s %s: %6.2f GB/s (%8.2f GiB in %9.2f ms)\n", name, span, gbps,
+           bytes / (1024.0 * 1024.0 * 1024.0), ms);
+  };
+  if (!g.valid)
+  {
+    printf("  (too few trace samples to split into regions; the figure above "
+           "is the whole run)\n");
+    return;
+  }
+
+  double lo = g_steady_lo_frac * 100.0, hi = g_steady_hi_frac * 100.0;
+  char head_span[16], steady_span[16], tail_span[16];
+  snprintf(head_span, sizeof(head_span), "[%3.0f-%3.0f%%]", 0.0, lo);
+  snprintf(steady_span, sizeof(steady_span), "[%3.0f-%3.0f%%]", lo, hi);
+  snprintf(tail_span, sizeof(tail_span), "[%3.0f-%3.0f%%]", hi, 100.0);
+  line("head", head_span, g.head_gbps, g.head_bytes, g.head_ms);
+  line("steady", steady_span, g.steady_gbps, g.steady_bytes, g.steady_ms);
+  line("tail", tail_span, g.tail_gbps, g.tail_bytes, g.tail_ms);
+}
+
 void printUsage(const char *prog_name)
 {
   printf("Usage: %s [OPTIONS]\n", prog_name);
@@ -87,8 +115,38 @@ void printUsage(const char *prog_name)
       "  --result-dir <path>    Custom result directory (default: auto-create "
       "result/YYYY-MM-DD_HH-MM-SS/)\n");
   printf(
-      "  --no-progress          Disable live progress bar during measurement "
-      "(reduces measurement noise for sweeps)\n");
+      "  --no-progress          Suppress the live progress lines (output only; "
+      "sampling still runs)\n");
+  printf(
+      "  --detail               Also print the head/steady/tail breakdown "
+      "under each result\n");
+  printf(
+      "                         (regions split at the --steady-range "
+      "boundaries of total bytes transferred)\n");
+  printf(
+      "  --steady-range <lo>:<hi>  Steady region boundaries as a percentage of "
+      "total bytes (default: 40:60)\n");
+  printf(
+      "                         Requires 0 < lo < hi < 100. A boundary on 0 or "
+      "100 empties a region, which makes every measurement fall back to the "
+      "whole-run rate\n");
+  printf(
+      "  --trace-interval-ms <ms>  Bandwidth time-series tick written to the "
+      "thread_trace CSV (default: 50)\n");
+  printf(
+      "                         A tick longer than the run leaves too few "
+      "samples to split regions, so the reported figure falls back to the "
+      "whole-run rate\n");
+  printf("\n");
+  printf("Reported bandwidth:\n");
+  printf(
+      "  The GB/s figure per mode is the STEADY region -- the byte window set "
+      "by --steady-range -- so\n");
+  printf(
+      "  device warm-up and the uneven thread-completion drain are excluded. "
+      "The time in\n");
+  printf(
+      "  parentheses is the WHOLE run, i.e. how long the measurement took.\n");
   printf("\n");
   printf("Other:\n");
   printf("  --help, -h             Show this help message\n");
@@ -115,31 +173,28 @@ void printUsage(const char *prog_name)
 
 int main(int argc, char *argv[])
 {
-  // Initialize variables
   int memory_per_thread_mib =
-      -1; // -1 means not set (will default to 100 MiB per thread)
+      -1;
   string mode = "seq,random";
   int num_threads = 1;
   const char *result_dir_path = nullptr;
   const char *devdax_path = nullptr;
-  int membind_node = -1; // -1 means not set
+  int membind_node = -1;
   string prefetch_option =
-      ""; // Empty means not set (don't control prefetcher)
+      "";
   bool bypass_cache = false;
-  const char *cpu_affinity_str = nullptr; // NUMA nodes for CPU affinity
+  const char *cpu_affinity_str = nullptr;
   uint64_t inject_delay_cycles =
-      0;                        // Inject delay for pointer chase (default: 0)
-  bool use_hugepage = false;    // Use 2MB huge pages for allocation
-  size_t devdax_offset = 0;     // Offset for devdax mmap (default: 0)
-  double zipfian_alpha = 0.99;  // Zipfian skew parameter (default: 0.99, YCSB)
+      0;
+  bool use_hugepage = false;
+  size_t devdax_offset = 0;
+  double zipfian_alpha = 0.99;
 
-  // Setup signal handlers for cleanup
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
   signal(SIGSEGV, signal_handler);
   signal(SIGBUS, signal_handler);
 
-  // Parse command line arguments (flag-based)
   for (int i = 1; i < argc; i++)
   {
     if (strcmp(argv[i], "--memory-per-thread") == 0)
@@ -246,6 +301,54 @@ int main(int argc, char *argv[])
     {
       g_progress_enabled = false;
     }
+    else if (strcmp(argv[i], "--detail") == 0)
+    {
+      g_detail_enabled = true;
+    }
+    else if (strcmp(argv[i], "--steady-range") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        fprintf(stderr, "Error: --steady-range requires a value\n");
+        return 1;
+      }
+
+      double lo = 0, hi = 0;
+      char trailing = 0;
+      if (sscanf(argv[++i], "%lf:%lf%c", &lo, &hi, &trailing) != 2)
+      {
+        fprintf(stderr,
+                "Error: --steady-range expects <lo>:<hi> in percent, e.g. "
+                "40:60 (got '%s')\n",
+                argv[i]);
+        return 1;
+      }
+
+      if (!(lo > 0.0) || !(hi > lo) || !(hi < 100.0))
+      {
+        fprintf(stderr,
+                "Error: --steady-range requires 0 < lo < hi < 100 (got "
+                "%g:%g)\n",
+                lo, hi);
+        return 1;
+      }
+      g_steady_lo_frac = lo / 100.0;
+      g_steady_hi_frac = hi / 100.0;
+    }
+    else if (strcmp(argv[i], "--trace-interval-ms") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        fprintf(stderr, "Error: --trace-interval-ms requires a value\n");
+        return 1;
+      }
+      g_thread_trace_interval_ms = atoi(argv[++i]);
+      if (g_thread_trace_interval_ms <= 0)
+      {
+        fprintf(stderr, "Error: --trace-interval-ms must be greater than 0\n");
+        return 1;
+      }
+    }
     else if (strcmp(argv[i], "--cpu-affinity") == 0)
     {
       if (i + 1 >= argc)
@@ -304,7 +407,6 @@ int main(int argc, char *argv[])
     }
   }
 
-  // Validate devdax and membind are mutually exclusive
   if (devdax_path && membind_node >= 0)
   {
     fprintf(stderr, "Error: --devdax and --membind cannot be used together\n");
@@ -317,13 +419,11 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  // Set default memory per thread if not specified
   if (memory_per_thread_mib <= 0)
   {
-    memory_per_thread_mib = 500; // Default: 500 MiB per thread
+    memory_per_thread_mib = 500;
   }
 
-  // Parse mode string (can be comma-separated)
   vector<string> modes;
   if (mode == "all")
   {
@@ -333,12 +433,10 @@ int main(int argc, char *argv[])
   }
   else
   {
-    // Parse comma-separated modes
     stringstream ss(mode);
     string token;
     while (getline(ss, token, ','))
     {
-      // Validate each mode
       if (token != "seq" && token != "random" && token != "stride" &&
           token != "seq_read" && token != "seq_write" &&
           token != "random_read" && token != "random_write" &&
@@ -363,7 +461,6 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  // Expand combined modes to detailed modes
   vector<string> expanded_modes;
   for (const auto &m : modes)
   {
@@ -397,19 +494,16 @@ int main(int argc, char *argv[])
     }
     else
     {
-      // Already a detailed mode (seq_read, seq_write, etc.)
       expanded_modes.push_back(m);
     }
   }
 
-  // Validate num_threads
   if (num_threads <= 0)
   {
     fprintf(stderr, "Error: threads must be positive\n");
     return 1;
   }
 
-  // Parse and validate NUMA nodes for CPU affinity
   vector<int> numa_nodes;
   vector<int> cpu_list;
   if (cpu_affinity_str)
@@ -444,7 +538,6 @@ int main(int argc, char *argv[])
     printf("\n");
   }
 
-  // Setup hardware prefetcher (only if --prefetch option was specified)
   if (!prefetch_option.empty())
   {
     if (!save_prefetcher_state())
@@ -466,7 +559,6 @@ int main(int argc, char *argv[])
     printf("Hardware prefetcher: not controlled (using system default)\n");
   }
 
-  // Validate NUMA node if specified (actual allocation happens later)
   if (membind_node >= 0)
   {
     if (numa_available() < 0)
@@ -476,7 +568,6 @@ int main(int argc, char *argv[])
       return 1;
     }
 
-    // Validate that the node exists
     int max_node = numa_max_node();
     if (membind_node > max_node)
     {
@@ -488,16 +579,13 @@ int main(int argc, char *argv[])
     printf("Will allocate memory on NUMA node %d\n", membind_node);
   }
 
-  // Create result directory
   char result_dir[512];
   if (result_dir_path)
   {
-    // Use user-specified directory
     snprintf(result_dir, sizeof(result_dir), "%s", result_dir_path);
   }
   else
   {
-    // Auto-create timestamped directory
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     char timestamp[64];
@@ -505,13 +593,13 @@ int main(int argc, char *argv[])
     snprintf(result_dir, sizeof(result_dir), "result/%s", timestamp);
   }
 
-  // Create result directory (including parent directories)
   char mkdir_cmd[1024];
   snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", result_dir);
   int mkdir_ret = system(mkdir_cmd);
   (void)mkdir_ret;
 
-  // Create output file path
+  g_thread_trace_dir = result_dir;
+
   char output_file_path_buf[1024];
   time_t now = time(NULL);
   struct tm *t = localtime(&now);
@@ -530,18 +618,15 @@ int main(int argc, char *argv[])
   printf("Output File: %s\n", output_file_path_buf);
   printf("\n");
 
-  // Calculate total memory size needed (for allocation)
   int total_memory_mib = memory_per_thread_mib * num_threads;
   size_t memory_size = (size_t)total_memory_mib * 1024 * 1024;
 
-  // Allocate memory (either devdax mmap or system memory)
   void *data;
   int devdax_fd = -1;
   bool using_devdax = (devdax_path != nullptr);
 
   if (using_devdax)
   {
-    // Open devdax device
     devdax_fd = open(devdax_path, O_RDWR);
     if (devdax_fd < 0)
     {
@@ -551,8 +636,6 @@ int main(int argc, char *argv[])
       return 1;
     }
 
-    // DevDAX doesn't support MAP_HUGETLB flag - it uses huge pages internally
-    // based on namespace alignment settings (configured via ndctl)
     data = mmap(NULL, memory_size, PROT_READ | PROT_WRITE,
                 MAP_SHARED | MAP_POPULATE, devdax_fd, devdax_offset);
     if (data == MAP_FAILED)
@@ -570,7 +653,6 @@ int main(int argc, char *argv[])
   {
     if (use_hugepage)
     {
-      // Use 2MB huge pages for TLB efficiency
       data = mmap(
           NULL, memory_size, PROT_READ | PROT_WRITE,
           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT),
@@ -578,7 +660,6 @@ int main(int argc, char *argv[])
 
       if (data != MAP_FAILED)
       {
-        // Bind to NUMA node using mbind
         unsigned long nodemask = 1UL << membind_node;
         if (mbind(data, memory_size, MPOL_BIND, &nodemask, sizeof(nodemask) * 8,
                   0) != 0)
@@ -603,7 +684,6 @@ int main(int argc, char *argv[])
     }
     else
     {
-      // Use numa_alloc_onnode for regular pages
       data = numa_alloc_onnode(memory_size, membind_node);
       if (data == NULL)
       {
@@ -617,8 +697,6 @@ int main(int argc, char *argv[])
   }
   else
   {
-    // Use traditional posix_memalign (should not reach here due to earlier
-    // validation)
     if (posix_memalign(&data, BLOCK_SIZE, memory_size) != 0)
     {
       fprintf(stderr, "Error: Failed to allocate %d MiB of memory\n",
@@ -631,21 +709,18 @@ int main(int argc, char *argv[])
 
   printf("Memory allocated successfully\n\n");
 
-  // Set global CPU affinity list for benchmark threads
   g_cpu_affinity_list = cpu_list;
 
-  // Save environment configuration
   saveEnvironmentJson(result_dir, mode, BLOCK_SIZE, STRIDE_SIZE, bypass_cache,
                       devdax_path);
 
 #ifdef ENABLE_TRACING
-  // Create tracing directory structure
+
   char tracing_dir[512];
   snprintf(tracing_dir, sizeof(tracing_dir), "%s/tracing", result_dir);
   mkdir(tracing_dir, 0755);
 #endif
 
-  // Check which detailed modes to run
   bool run_seq_read = false, run_seq_write = false;
   bool run_random_read = false, run_random_write = false;
   bool run_stride_read = false, run_stride_write = false;
@@ -671,7 +746,6 @@ int main(int argc, char *argv[])
       run_pointer_chase = true;
   }
 
-  // Check if file exists and has content (to avoid duplicate headers)
   bool file_exists = false;
   bool has_header = false;
   FILE *check_file = fopen(output_file_path_buf, "r");
@@ -681,7 +755,6 @@ int main(int argc, char *argv[])
     char first_line[1024];
     if (fgets(first_line, sizeof(first_line), check_file))
     {
-      // Check if first line starts with "# Threads" (header)
       if (strncmp(first_line, "# Threads", 9) == 0)
       {
         has_header = true;
@@ -690,7 +763,6 @@ int main(int argc, char *argv[])
     fclose(check_file);
   }
 
-  // Open CSV output file (append mode if file exists)
   FILE *output_file = fopen(output_file_path_buf, file_exists ? "a" : "w");
   if (!output_file)
   {
@@ -709,7 +781,6 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  // Write header only if file doesn't have one
   if (!has_header)
   {
     fprintf(output_file, "# Threads");
@@ -748,12 +819,10 @@ int main(int argc, char *argv[])
     fprintf(output_file, "\n");
   }
 
-  // Run benchmarks with specified thread count
   printf("\n========================================\n");
   printf("Testing with %d threads\n", num_threads);
   printf("========================================\n");
 
-  // Calculate memory to use
   size_t memory_to_use =
       (size_t)num_threads * memory_per_thread_mib * 1024 * 1024;
 
@@ -773,7 +842,6 @@ int main(int argc, char *argv[])
 
   if (run_seq_read)
   {
-    // Sequential Read
     printf("Running Sequential Read test...\n");
 #ifdef ENABLE_TRACING
     clearTraceBuffers();
@@ -787,6 +855,7 @@ int main(int argc, char *argv[])
     seq_read_ms = seq_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            seq_read_result.bandwidth_gbps, seq_read_result.elapsed_ms);
+    printDetail(seq_read_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/seq_read", tracing_dir);
@@ -807,7 +876,6 @@ int main(int argc, char *argv[])
 
   if (run_seq_write)
   {
-    // Sequential Write
     printf("Running Sequential Write test...\n");
 #ifdef ENABLE_TRACING
     clearTraceBuffers();
@@ -818,6 +886,7 @@ int main(int argc, char *argv[])
     seq_write_ms = seq_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            seq_write_result.bandwidth_gbps, seq_write_result.elapsed_ms);
+    printDetail(seq_write_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/seq_write", tracing_dir);
@@ -839,7 +908,6 @@ int main(int argc, char *argv[])
 
   if (run_random_read)
   {
-    // Random Read
     printf("Running Random Read test...\n");
 #ifdef ENABLE_TRACING
     clearTraceBuffers();
@@ -852,6 +920,7 @@ int main(int argc, char *argv[])
     rand_read_ms = rand_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            rand_read_result.bandwidth_gbps, rand_read_result.elapsed_ms);
+    printDetail(rand_read_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/random_read", tracing_dir);
@@ -872,7 +941,6 @@ int main(int argc, char *argv[])
 
   if (run_random_write)
   {
-    // Random Write
     printf("Running Random Write test...\n");
 #ifdef ENABLE_TRACING
     clearTraceBuffers();
@@ -883,6 +951,7 @@ int main(int argc, char *argv[])
     rand_write_ms = rand_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            rand_write_result.bandwidth_gbps, rand_write_result.elapsed_ms);
+    printDetail(rand_write_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/random_write", tracing_dir);
@@ -897,7 +966,6 @@ int main(int argc, char *argv[])
     printf("\n");
   }
 
-  // Zipfian Read Test
   if (run_zipfian_read)
   {
     printf("[Zipfian Tests (%zu bytes blocks, alpha=%.2f)]\n", BLOCK_SIZE, zipfian_alpha);
@@ -913,6 +981,7 @@ int main(int argc, char *argv[])
     zipfian_read_ms = zipfian_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            zipfian_read_result.bandwidth_gbps, zipfian_read_result.elapsed_ms);
+    printDetail(zipfian_read_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/zipfian_read", tracing_dir);
@@ -940,7 +1009,6 @@ int main(int argc, char *argv[])
 
   if (run_stride_read)
   {
-    // Stride Read
     printf("Running Stride Read test...\n");
 #ifdef ENABLE_TRACING
     clearTraceBuffers();
@@ -951,6 +1019,7 @@ int main(int argc, char *argv[])
     stride_read_ms = stride_read_result.elapsed_ms;
     printf("Read Bandwidth:  %.2f GB/s (%.2f ms)\n",
            stride_read_result.bandwidth_gbps, stride_read_result.elapsed_ms);
+    printDetail(stride_read_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/stride_read", tracing_dir);
@@ -962,7 +1031,6 @@ int main(int argc, char *argv[])
 
   if (run_stride_write)
   {
-    // Stride Write
     printf("Running Stride Write test...\n");
 #ifdef ENABLE_TRACING
     clearTraceBuffers();
@@ -973,6 +1041,7 @@ int main(int argc, char *argv[])
     stride_write_ms = stride_write_result.elapsed_ms;
     printf("Write Bandwidth: %.2f GB/s (%.2f ms)\n",
            stride_write_result.bandwidth_gbps, stride_write_result.elapsed_ms);
+    printDetail(stride_write_result);
 #ifdef ENABLE_TRACING
     char test_dir[1024];
     snprintf(test_dir, sizeof(test_dir), "%s/stride_write", tracing_dir);
@@ -990,7 +1059,6 @@ int main(int argc, char *argv[])
     printf("\n");
   }
 
-  // Pointer Chase with Load Test
   if (run_pointer_chase)
   {
     printf("[Pointer Chase with Load (inject delay: %lu cycles)]\n",
@@ -1006,6 +1074,7 @@ int main(int argc, char *argv[])
     printf("Load Bandwidth: %.2f GB/s (%.2f ms)\n",
            pointer_chase_result.bandwidth_gbps,
            pointer_chase_result.elapsed_ms);
+    printDetail(pointer_chase_result);
 #ifdef ENABLE_LATENCY_MEASURE
     {
       char latency_file[1024];
@@ -1018,7 +1087,6 @@ int main(int argc, char *argv[])
     printf("\n");
   }
 
-  // Write results (space-separated)
   fprintf(output_file, "%d", num_threads);
   if (run_seq_read)
   {
@@ -1061,14 +1129,12 @@ int main(int argc, char *argv[])
   printf("Results saved to: %s\n", output_file_path_buf);
   printf("========================================\n\n");
 
-  // Update symlink to latest result (only if we auto-created the directory)
   if (!result_dir_path)
   {
-    // Extract just the timestamp directory name
     const char *dir_name = strrchr(result_dir, '/');
     if (dir_name)
     {
-      dir_name++; // Skip the '/'
+      dir_name++;
       char symlink_cmd[1024];
       snprintf(symlink_cmd, sizeof(symlink_cmd),
                "ln -sfn %s result/latest_result", dir_name);
@@ -1078,7 +1144,6 @@ int main(int argc, char *argv[])
     }
   }
 
-  // Free memory
   if (using_devdax)
   {
     munmap(data, memory_size);
@@ -1096,7 +1161,6 @@ int main(int argc, char *argv[])
     printf("Memory freed\n");
   }
 
-  // Restore hardware prefetcher state
   restore_prefetcher_state();
   printf("Hardware prefetcher state restored\n");
 

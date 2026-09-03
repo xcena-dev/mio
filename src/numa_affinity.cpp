@@ -9,7 +9,7 @@
 
 std::vector<int> parseNumaNodes(const char* numa_node_str) {
     std::vector<int> numa_nodes;
-    std::set<int> unique_nodes; // To avoid duplicates
+    std::set<int> unique_nodes;
 
     if (!numa_node_str) {
         return numa_nodes;
@@ -19,17 +19,15 @@ std::vector<int> parseNumaNodes(const char* numa_node_str) {
     char* token = strtok(str_copy, ",");
 
     while (token) {
-        // Trim whitespace
         while (*token == ' ' || *token == '\t') token++;
 
         char* end;
         long node = strtol(token, &end, 10);
 
-        // Check for parsing errors
         if (end == token || *end != '\0') {
             fprintf(stderr, "Error: Invalid NUMA node format: '%s'\n", token);
             free(str_copy);
-            return std::vector<int>(); // Return empty vector on error
+            return std::vector<int>();
         }
 
         if (node < 0) {
@@ -44,7 +42,6 @@ std::vector<int> parseNumaNodes(const char* numa_node_str) {
 
     free(str_copy);
 
-    // Convert set to vector (maintains sorted order)
     numa_nodes.assign(unique_nodes.begin(), unique_nodes.end());
     return numa_nodes;
 }
@@ -60,16 +57,13 @@ std::vector<int> getCpusFromNumaNodes(const std::vector<int>& numa_nodes) {
     struct bitmask* cpumask = numa_allocate_cpumask();
 
     for (int node : numa_nodes) {
-        // Clear the mask
         numa_bitmask_clearall(cpumask);
 
-        // Get CPUs for this NUMA node
         if (numa_node_to_cpus(node, cpumask) < 0) {
             fprintf(stderr, "Warning: Failed to get CPUs for NUMA node %d\n", node);
             continue;
         }
 
-        // Add all set bits (CPUs) to our list
         for (unsigned int cpu = 0; cpu < cpumask->size; cpu++) {
             if (numa_bitmask_isbitset(cpumask, cpu)) {
                 cpu_list.push_back(cpu);
@@ -112,14 +106,12 @@ bool validateNumaNodes(const std::vector<int>& numa_nodes) {
     int max_node = numa_max_node();
 
     for (int node : numa_nodes) {
-        // Check if node exists
         if (node > max_node) {
             fprintf(stderr, "Error: NUMA node %d does not exist (max: %d)\n",
                     node, max_node);
             return false;
         }
 
-        // Check if node has CPUs
         struct bitmask* cpumask = numa_allocate_cpumask();
         numa_bitmask_clearall(cpumask);
 
@@ -129,7 +121,6 @@ bool validateNumaNodes(const std::vector<int>& numa_nodes) {
             return false;
         }
 
-        // Check if any CPU is set
         bool has_cpus = false;
         for (unsigned int cpu = 0; cpu < cpumask->size; cpu++) {
             if (numa_bitmask_isbitset(cpumask, cpu)) {

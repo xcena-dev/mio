@@ -18,7 +18,6 @@ void saveEnvironmentJson(const char* result_dir, const string& mode, size_t bloc
         return;
     }
 
-    // Get system information
     char hostname[256] = "unknown";
     gethostname(hostname, sizeof(hostname));
 
@@ -26,7 +25,6 @@ void saveEnvironmentJson(const char* result_dir, const string& mode, size_t bloc
     FILE* uname_fp = popen("uname -r", "r");
     if (uname_fp) {
         if (fgets(kernel, sizeof(kernel), uname_fp)) {
-            // Remove newline
             kernel[strcspn(kernel, "\n")] = 0;
         }
         pclose(uname_fp);
@@ -55,12 +53,10 @@ void saveEnvironmentJson(const char* result_dir, const string& mode, size_t bloc
         fclose(mem_fp);
     }
 
-    // Get current timestamp
     time_t now = time(NULL);
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", localtime(&now));
 
-    // Write JSON
     fprintf(fp, "{\n");
     fprintf(fp, "  \"timestamp\": \"%s\",\n", timestamp);
     fprintf(fp, "  \"mode\": \"%s\",\n", mode.c_str());
